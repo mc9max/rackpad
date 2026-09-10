@@ -1,0 +1,30 @@
+{
+  "PORT": {
+    "description": "Port the Rackpad server listens on.",
+    "defaultValue": "3000"
+  },
+  "DATABASE_PATH": {
+    "description": "Filesystem path for the SQLite database. Backed by the /data Railway volume.",
+    "defaultValue": "/data/rackpad.db"
+  },
+  "HOST": {
+    "description": "Host address to bind. Keep 0.0.0.0 for Railway.",
+    "defaultValue": "0.0.0.0"
+  },
+  "NODE_ENV": {
+    "description": "Node environment. Keep production for Railway.",
+    "defaultValue": "production"
+  },
+  "TRUST_PROXY": {
+    "description": "Trust reverse proxy headers. Set to 1 if behind Railway's proxy (recommended).",
+    "defaultValue": "1"
+  },
+  "APP_URL": {
+    "description": "Public URL for OIDC redirects and links. Auto-derived from Railway public domain.",
+    "defaultValue": "https://${{RAILWAY_PUBLIC_DOMAIN}}"
+  },
+  "OIDC_ENABLED": {
+    "description": "Enable OIDC single sign-on. Configure OIDC_* vars in Variables tab before enabling.",
+    "defaultValue": "0"
+  }
+}

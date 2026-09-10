@@ -1,0 +1,2054 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
+import {
+  Background,
+  Controls,
+  Handle,
+  MiniMap,
+  Panel,
+  Position,
+  ReactFlow,
+  useEdgesState,
+  useNodesState,
+  useStore as useReactFlowStore,
+  useUpdateNodeInternals,
+  type Edge as FlowEdge,
+  type Node as FlowNode,
+  type NodeMouseHandler,
+  type NodeProps,
+  type NodeTypes,
+  type OnNodeDrag,
+  type XYPosition,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import { AlertTriangle, ExternalLink, GitBranch, RotateCcw } from "lucide-react";
+import { Button } from "@/components/ui/Button";
+import { Badge } from "@/components/ui/Badge";
+import { PhysicalFaceplate } from "@/components/rack/PhysicalFaceplate";
+import { DeviceTypeIcon } from "@/components/shared/DeviceTypeIcon";
+import { StatusDot } from "@/components/shared/StatusDot";
+import { formatDeviceAddress } from "@/lib/network-labels";
+import type {
+  Device,
+  DevicePhysicalLayout,
+  Port,
+  VirtualSwitch,
+  WifiAccessPoint,
+  WifiClientAssociation,
+  WifiSsid,
+} from "@/lib/types";
+import { cn, formatPortLabel, normalizeColorToCss } from "@/lib/utils";
+import { localizedDeviceTypeIdLabel } from "@/lib/device-types";
+import { isRackStudioPhysicalDevice } from "@/lib/rack-studio";
+import { useStore } from "@/lib/store";
+import { nodeStripeColor, typeColor, typeLabel } from "./model";
+import type {
+  VisualizerCable,
+  VisualizerDiagramNodeStyle,
+  VisualizerHealth,
+  VisualizerModel,
+  VisualizerNode,
+  VisualizerRackFaceMode,
+} from "./types";
+import { useI18n } from "@/i18n";
+import type { TranslationKey } from "@/i18n/translations";
+import {
+  buildPhysicalNodePresentation,
+  physicalHandlePlacement,
+  physicalPortHandleId,
+  type PhysicalNodePresentation,
+} from "./physical-node";
+
+const DIAGRAM_POSITIONS_STORAGE_KEY = "rackpad.visualizer.diagram-positions";
+const DIAGRAM_SECTION_POSITIONS_STORAGE_KEY =
+  "rackpad.visualizer.diagram-section-positions";
+const SECTION_PADDING_X = 24;
+const SECTION_PADDING_BOTTOM = 30;
+const SECTION_HEADER_HEIGHT = 84;
+const SECTION_GAP_X = 56;
+const SECTION_GAP_Y = 56;
+const SECTION_START_X = 36;
+const SECTION_START_Y = 116;
+const ROW_MAX_WIDTH = 1900;
+const DEVICE_NODE_WIDTH = 300;
+const DEVICE_NODE_HEIGHT = 92;
+const DEVICE_GAP_X = 30;
+const DEVICE_GAP_Y = 24;
+const STACKED_DEVICE_GAP_Y = 14;
+const EDGE_LABEL_LIMIT = 42;
+
+interface DiagramCanvasProps {
+  model: VisualizerModel;
+  loading: boolean;
+  healthOverlay: boolean;
+  cableType: string;
+  wifiSsids: WifiSsid[];
+  wifiAccessPoints: WifiAccessPoint[];
+  wifiClientAssociations: WifiClientAssociation[];
+  virtualSwitches: VirtualSwitch[];
+  nodeStyle: VisualizerDiagramNodeStyle;
+  physicalLayouts: DevicePhysicalLayout[];
+  physicalFaceMode: VisualizerRackFaceMode;
+}
+
+interface DiagramPortData {
+  id: string;
+  linked: boolean;
+  color: string | null;
+}
+
+interface DiagramDeviceData extends Record<string, unknown> {
+  address: string;
+  deviceId: string;
+  deviceType: string;
+  health: VisualizerHealth;
+  hostname: string;
+  connectionCount: number;
+  portSummary: string;
+  ports: DiagramPortData[];
+  sectionLabel: string;
+  stripeColor: string;
+  typeColor: string;
+  typeLabel: string;
+  nodeStyle: VisualizerDiagramNodeStyle;
+  physicalLayout?: DevicePhysicalLayout;
+  physicalPresentation?: PhysicalNodePresentation;
+  physicalPorts: Port[];
+  linkedPortIds: string[];
+}
+
+interface DiagramSectionData extends Record<string, unknown> {
+  accent: string;
+  countLabel: string;
+  subtitle: string;
+  title: string;
+}
+
+interface DiagramWifiContext {
+  accessPointByDeviceId: Record<string, WifiAccessPoint>;
+  associationByClientId: Record<string, WifiClientAssociation>;
+  ssidById: Record<string, WifiSsid>;
+}
+
+type DiagramDeviceNode = FlowNode<DiagramDeviceData, "device">;
+type DiagramSectionNode = FlowNode<DiagramSectionData, "section">;
+type DiagramFlowNode = DiagramDeviceNode | DiagramSectionNode;
+
+interface DiagramEdgeData extends Record<string, unknown> {
+  cableId: string;
+}
+
+type DiagramFlowEdge = FlowEdge<DiagramEdgeData, "smoothstep">;
+
+interface DiagramSection {
+  id: string;
+  title: string;
+  subtitle: string;
+  accent: string;
+  layout: "grid" | "stack";
+  sortGroup: number;
+  nodes: VisualizerNode[];
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  columns: number;
+  columnWidths: number[];
+  rowHeights: number[];
+}
+
+interface DiagramNodeGeometry {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface DiagramLayoutResult {
+  flowNodes: DiagramFlowNode[];
+  flowEdges: DiagramFlowEdge[];
+  sections: DiagramSection[];
+  visibleDeviceCount: number;
+  hiddenDeviceCount: number;
+  visibleDeviceIds: Set<string>;
+  visibleCableCount: number;
+}
+
+interface DiagramDragOrigin {
+  sectionId: string;
+  sectionStart: XYPosition;
+  deviceStarts: Record<string, XYPosition>;
+}
+
+interface VirtualNetworkRow {
+  id: string;
+  device?: Device;
+  host?: Device;
+  port?: Port;
+  role: string;
+  virtualSwitch?: VirtualSwitch;
+}
+
+const nodeTypes = {
+  device: DiagramDeviceCard,
+  section: DiagramSectionCard,
+} as NodeTypes;
+
+export function DiagramCanvas({
+  model,
+  loading,
+  healthOverlay,
+  cableType,
+  wifiSsids,
+  wifiAccessPoints,
+  wifiClientAssociations,
+  virtualSwitches,
+  nodeStyle,
+  physicalLayouts,
+  physicalFaceMode,
+}: DiagramCanvasProps) {
+  const { t } = useI18n();
+  const [savedPositions, setSavedPositions] = useState<
+    Record<string, XYPosition>
+  >(() => readDiagramPositions(DIAGRAM_POSITIONS_STORAGE_KEY));
+  const [savedSectionPositions, setSavedSectionPositions] = useState<
+    Record<string, XYPosition>
+  >(() => readDiagramPositions(DIAGRAM_SECTION_POSITIONS_STORAGE_KEY));
+  const [typeFilters, setTypeFilters] = useState<Set<string>>(new Set());
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+  const [selectedCableId, setSelectedCableId] = useState<string | null>(null);
+  const sectionDragOriginRef = useRef<DiagramDragOrigin | null>(null);
+  const wifiContext = useMemo(
+    () =>
+      buildDiagramWifiContext(
+        wifiSsids,
+        wifiAccessPoints,
+        wifiClientAssociations,
+      ),
+    [wifiSsids, wifiAccessPoints, wifiClientAssociations],
+  );
+  const {
+    flowNodes,
+    flowEdges,
+    sections,
+    visibleDeviceCount,
+    hiddenDeviceCount,
+    visibleDeviceIds,
+    visibleCableCount,
+  } = useMemo(
+    () =>
+      buildDiagramLayout(
+        model,
+        cableType,
+        healthOverlay,
+        typeFilters,
+        savedPositions,
+        savedSectionPositions,
+        wifiContext,
+        nodeStyle,
+        physicalLayouts,
+        physicalFaceMode,
+        t,
+      ),
+    [
+      model,
+      cableType,
+      healthOverlay,
+      typeFilters,
+      savedPositions,
+      savedSectionPositions,
+      wifiContext,
+      nodeStyle,
+      physicalLayouts,
+      physicalFaceMode,
+      t,
+    ],
+  );
+  const [nodes, setNodes, onNodesChange] =
+    useNodesState<DiagramFlowNode>(flowNodes);
+  const [edges, setEdges, onEdgesChange] =
+    useEdgesState<DiagramFlowEdge>(flowEdges);
+
+  useEffect(() => {
+    setNodes(flowNodes);
+  }, [flowNodes, setNodes]);
+
+  useEffect(() => {
+    setEdges(flowEdges);
+  }, [flowEdges, setEdges]);
+
+  useEffect(() => {
+    if (selectedDeviceId && !visibleDeviceIds.has(selectedDeviceId)) {
+      setSelectedDeviceId(null);
+    }
+    if (
+      selectedCableId &&
+      !flowEdges.some((edge) => edge.id === selectedCableId)
+    ) {
+      setSelectedCableId(null);
+    }
+  }, [flowEdges, selectedCableId, selectedDeviceId, visibleDeviceIds]);
+
+  const sectionDeviceIdsById = useMemo(
+    () =>
+      Object.fromEntries(
+        sections.map((section) => [
+          section.id,
+          new Set(section.nodes.map((node) => node.device.id)),
+        ]),
+      ) as Record<string, Set<string>>,
+    [sections],
+  );
+
+  const selectedNode = selectedDeviceId
+    ? model.nodesByDeviceId[selectedDeviceId]
+    : null;
+  const selectedCable = selectedCableId
+    ? model.cableById[selectedCableId]
+    : null;
+  const connectedCables = selectedNode
+    ? model.cables.filter(
+        (cable) =>
+          cableIsVisible(cable, cableType) &&
+          cableHasVisibleEndpoints(cable, visibleDeviceIds) &&
+          (cable.fromDevice?.id === selectedNode.device.id ||
+            cable.toDevice?.id === selectedNode.device.id),
+      )
+    : [];
+  const displayEdges = useMemo(
+    () =>
+      edges.map((edge) => {
+        const highlighted =
+          selectedCableId === edge.id ||
+          (selectedDeviceId != null &&
+            (edge.source === selectedDeviceId ||
+              edge.target === selectedDeviceId));
+        const dimmed =
+          Boolean(selectedCableId || selectedDeviceId) && !highlighted;
+        return {
+          ...edge,
+          animated: highlighted,
+          zIndex: highlighted ? 8 : 1,
+          style: {
+            ...edge.style,
+            strokeOpacity: highlighted
+              ? 0.96
+              : dimmed
+                ? 0.14
+                : edge.style?.strokeOpacity,
+            strokeWidth: highlighted ? 4 : edge.style?.strokeWidth,
+          },
+        };
+      }),
+    [edges, selectedCableId, selectedDeviceId],
+  );
+
+  const handleNodeClick: NodeMouseHandler<DiagramFlowNode> = (_, node) => {
+    if (node.type !== "device") return;
+    setSelectedDeviceId(node.data.deviceId);
+    setSelectedCableId(null);
+  };
+
+  const handleNodeDragStart: OnNodeDrag<DiagramFlowNode> = (_, node) => {
+    if (node.type !== "section") {
+      sectionDragOriginRef.current = null;
+      return;
+    }
+    const childIds = sectionDeviceIdsById[node.id] ?? new Set<string>();
+    const deviceStarts = Object.fromEntries(
+      nodes
+        .filter((entry) => childIds.has(entry.id))
+        .map((entry) => [entry.id, { ...entry.position }]),
+    );
+    sectionDragOriginRef.current = {
+      sectionId: node.id,
+      sectionStart: { ...node.position },
+      deviceStarts,
+    };
+    setSelectedDeviceId(null);
+    setSelectedCableId(null);
+  };
+
+  const handleNodeDrag: OnNodeDrag<DiagramFlowNode> = (_, node) => {
+    const origin = sectionDragOriginRef.current;
+    if (!origin || node.type !== "section" || node.id !== origin.sectionId) {
+      return;
+    }
+    const delta = {
+      x: node.position.x - origin.sectionStart.x,
+      y: node.position.y - origin.sectionStart.y,
+    };
+    const childIds = sectionDeviceIdsById[node.id] ?? new Set<string>();
+    setNodes((current) =>
+      current.map((entry) => {
+        if (entry.id === node.id) {
+          return {
+            ...entry,
+            position: {
+              x: Math.round(node.position.x),
+              y: Math.round(node.position.y),
+            },
+          };
+        }
+        if (!childIds.has(entry.id)) return entry;
+        const start = origin.deviceStarts[entry.id];
+        if (!start) return entry;
+        return {
+          ...entry,
+          position: {
+            x: Math.round(start.x + delta.x),
+            y: Math.round(start.y + delta.y),
+          },
+        };
+      }),
+    );
+  };
+
+  const handleNodeDragStop: OnNodeDrag<DiagramFlowNode> = (_, node) => {
+    if (node.type === "section") {
+      const origin = sectionDragOriginRef.current;
+      if (!origin || origin.sectionId !== node.id) return;
+      const delta = {
+        x: node.position.x - origin.sectionStart.x,
+        y: node.position.y - origin.sectionStart.y,
+      };
+      const nextSectionPositions = {
+        ...savedSectionPositions,
+        [node.id]: {
+          x: Math.round(node.position.x),
+          y: Math.round(node.position.y),
+        },
+      };
+      const movedDevicePositions = Object.fromEntries(
+        Object.entries(origin.deviceStarts).map(([deviceId, start]) => [
+          deviceId,
+          {
+            x: Math.round(start.x + delta.x),
+            y: Math.round(start.y + delta.y),
+          },
+        ]),
+      );
+      const nextPositions = {
+        ...savedPositions,
+        ...movedDevicePositions,
+      };
+      setSavedSectionPositions(nextSectionPositions);
+      setSavedPositions(nextPositions);
+      writeDiagramPositions(
+        DIAGRAM_SECTION_POSITIONS_STORAGE_KEY,
+        nextSectionPositions,
+      );
+      writeDiagramPositions(DIAGRAM_POSITIONS_STORAGE_KEY, nextPositions);
+      sectionDragOriginRef.current = null;
+      return;
+    }
+    if (node.type !== "device") return;
+    setSavedPositions((current) => {
+      const next = {
+        ...current,
+        [node.data.deviceId]: {
+          x: Math.round(node.position.x),
+          y: Math.round(node.position.y),
+        },
+      };
+      writeDiagramPositions(DIAGRAM_POSITIONS_STORAGE_KEY, next);
+      return next;
+    });
+  };
+
+  function resetPositions() {
+    setSavedPositions({});
+    setSavedSectionPositions({});
+    writeDiagramPositions(DIAGRAM_POSITIONS_STORAGE_KEY, {});
+    writeDiagramPositions(DIAGRAM_SECTION_POSITIONS_STORAGE_KEY, {});
+  }
+
+  function toggleTypeFilter(type: string) {
+    setTypeFilters((current) => {
+      const next = new Set(current);
+      if (next.has(type)) next.delete(type);
+      else next.add(type);
+      return next;
+    });
+  }
+
+  if (loading) {
+    return (
+      <div className="grid h-[calc(100vh-8.5rem)] min-h-[620px] place-items-center border-t border-[var(--border-subtle)] bg-[var(--surface-1)]">
+        <div className="rk-panel rounded-[var(--radius-md)] p-5 text-sm text-[var(--text-secondary)]">
+          {t("Building topology diagram...")}
+        </div>
+      </div>
+    );
+  }
+
+  if (model.nodes.length === 0) {
+    return (
+      <div className="grid h-[calc(100vh-8.5rem)] min-h-[620px] place-items-center border-t border-[var(--border-subtle)] bg-grid">
+        <div className="rk-panel max-w-sm rounded-[var(--radius-md)] p-5 text-center">
+          <div className="text-sm font-semibold text-[var(--text-primary)]">
+            {t("No devices to diagram")}
+          </div>
+          <p className="mt-2 text-xs leading-5 text-[var(--text-secondary)]">
+            {t(
+              "Add devices, ports, and cables to build a draw-style topology map.",
+            )}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="visualizer-diagram relative h-[calc(100vh-8.5rem)] min-h-[620px] overflow-hidden border-t border-[var(--border-subtle)] bg-[var(--surface-1)]">
+      <ReactFlow<DiagramFlowNode, DiagramFlowEdge>
+        nodes={nodes}
+        edges={displayEdges}
+        nodeTypes={nodeTypes}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onNodeClick={handleNodeClick}
+        onNodeDragStart={handleNodeDragStart}
+        onNodeDrag={handleNodeDrag}
+        onNodeDragStop={handleNodeDragStop}
+        onEdgeClick={(_, edge) => {
+          setSelectedCableId(edge.id);
+          setSelectedDeviceId(null);
+        }}
+        onPaneClick={() => {
+          setSelectedDeviceId(null);
+          setSelectedCableId(null);
+        }}
+        fitView
+        fitViewOptions={{
+          padding: 0.14,
+          includeHiddenNodes: false,
+          minZoom: 0.42,
+          maxZoom: 1,
+        }}
+        minZoom={0.12}
+        maxZoom={1.8}
+        nodesConnectable={false}
+        elementsSelectable
+        panOnScroll
+        selectionOnDrag
+        proOptions={{ hideAttribution: true }}
+        className="bg-[var(--surface-1)]"
+      >
+        <Background color="var(--bg-grid)" gap={24} size={1} />
+        <Controls
+          position="bottom-left"
+          className="visualizer-diagram-controls"
+        />
+        <MiniMap
+          pannable
+          zoomable
+          position="bottom-right"
+          className="visualizer-diagram-minimap"
+          maskColor="rgb(15 22 33 / 0.52)"
+          nodeStrokeWidth={2}
+          style={{ width: 160, height: 108 }}
+          nodeColor={(node) =>
+            node.type === "section"
+              ? "var(--surface-4)"
+              : "var(--accent-primary)"
+          }
+        />
+        <Panel
+          position="top-left"
+          className="rk-panel flex max-w-[calc(100vw-28rem)] flex-col gap-2 rounded-[var(--radius-md)] px-3 py-2 text-xs shadow-[var(--shadow-card)]"
+        >
+          <div className="flex w-full items-center gap-3">
+            <span className="grid size-8 place-items-center rounded-[var(--radius-sm)] border border-[var(--accent-secondary-border)] bg-[var(--accent-secondary-soft)] text-[var(--accent-secondary)]">
+              <GitBranch className="size-4" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="rk-kicker">
+                {nodeStyle === "physical"
+                  ? t("Physical layout")
+                  : t("Diagram view")}
+              </div>
+              <div className="truncate text-[11px] text-[var(--text-secondary)]">
+                {sections.length} {t("sections |")}
+                {visibleDeviceCount} {t("shown")}
+                {hiddenDeviceCount > 0
+                  ? t("/ {hiddenDeviceCount} hidden", {
+                      hiddenDeviceCount: hiddenDeviceCount,
+                    })
+                  : ""}{" "}
+                | {visibleCableCount} {t("visible cables")}
+              </div>
+            </div>
+            {Object.keys(savedPositions).length +
+              Object.keys(savedSectionPositions).length >
+              0 && (
+              <Button variant="ghost" size="sm" onClick={resetPositions}>
+                <RotateCcw className="size-3.5" />
+                {t("Reset positions")}
+              </Button>
+            )}
+          </div>
+          <div className="flex w-full max-w-full items-center gap-1.5 overflow-x-auto pb-0.5">
+            <DiagramTypeChip
+              active={typeFilters.size === 0}
+              label={t("All {devices}", { devices: model.counts.devices })}
+              onClick={() => setTypeFilters(new Set())}
+            />
+            {model.deviceTypes.map((entry) => (
+              <DiagramTypeChip
+                key={entry.type}
+                active={typeFilters.has(entry.type)}
+                label={t("{label} {count}", {
+                  label: localizedDeviceTypeIdLabel(
+                    entry.type,
+                    [],
+                    t,
+                    entry.label,
+                  ),
+                  count: entry.count,
+                })}
+                onClick={() => toggleTypeFilter(entry.type)}
+              />
+            ))}
+          </div>
+        </Panel>
+        {(selectedNode || selectedCable) && (
+          <Panel
+            position="top-right"
+            className="rk-panel max-h-[calc(100vh-11rem)] w-[360px] overflow-y-auto rounded-[var(--radius-md)] p-3 shadow-[var(--shadow-card)]"
+          >
+            {selectedNode && (
+              <DiagramDeviceInspector
+                node={selectedNode}
+                model={model}
+                connectedCables={connectedCables}
+                virtualSwitches={virtualSwitches}
+              />
+            )}
+            {selectedCable && <DiagramCableInspector cable={selectedCable} />}
+          </Panel>
+        )}
+      </ReactFlow>
+    </div>
+  );
+}
+
+function DiagramDeviceCard(props: NodeProps<DiagramDeviceNode>) {
+  if (
+    props.data.nodeStyle === "physical" &&
+    props.data.physicalLayout &&
+    props.data.physicalPresentation
+  ) {
+    return <PhysicalDiagramDeviceCard {...props} />;
+  }
+  return <CompactDiagramDeviceCard {...props} />;
+}
+
+function CompactDiagramDeviceCard({
+  data,
+  selected,
+}: NodeProps<DiagramDeviceNode>) {
+  const { t } = useI18n();
+  const shownPorts = data.ports.slice(0, 24);
+  const hiddenPortCount = Math.max(0, data.ports.length - shownPorts.length);
+
+  return (
+    <div
+      className={cn(
+        "relative overflow-hidden rounded-[var(--radius-md)] border bg-[var(--surface-2)] px-3 py-2.5 text-left shadow-[0_14px_30px_rgb(0_0_0_/_0.18)] transition-colors",
+        selected
+          ? "border-[var(--accent-primary-border)] shadow-[var(--shadow-selected)]"
+          : "border-[var(--border-default)]",
+      )}
+      style={{ width: DEVICE_NODE_WIDTH, height: DEVICE_NODE_HEIGHT }}
+      title={t("{hostname}{value2}", {
+        hostname: data.hostname,
+        value2: data.address ? ` | ${data.address}` : "",
+      })}
+    >
+      <DiagramHandles />
+      <span
+        className="absolute inset-y-2 left-1 w-0.5 rounded-full"
+        style={{ background: data.stripeColor }}
+      />
+      <div className="flex min-w-0 items-start gap-2 pl-1.5">
+        <span
+          className="grid size-7 shrink-0 place-items-center rounded-[var(--radius-sm)] border border-[var(--border-subtle)] bg-[var(--surface-1)]"
+          style={{ color: data.typeColor }}
+        >
+          <DeviceTypeIcon type={data.deviceType} className="size-4" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="truncate text-[13px] font-semibold text-[var(--text-primary)]">
+              {data.hostname}
+            </span>
+            <StatusDot status={healthToDeviceStatus(data.health)} />
+          </div>
+          <div className="mt-0.5 truncate font-mono text-[9px] text-[var(--text-tertiary)]">
+            {data.address}
+          </div>
+          <div className="mt-1 flex min-w-0 items-center gap-2 text-[9px] uppercase tracking-[0.13em] text-[var(--text-muted)]">
+            <span className="truncate">{data.typeLabel}</span>
+            <span className="shrink-0">|</span>
+            <span className="shrink-0">{data.portSummary}</span>
+            <span className="shrink-0">|</span>
+            <span className="shrink-0">
+              {data.connectionCount} {t("links")}
+            </span>
+          </div>
+        </div>
+        <Link
+          to={`/devices/${data.deviceId}`}
+          className="nodrag nopan grid size-7 shrink-0 place-items-center rounded-[var(--radius-sm)] border border-[var(--border-subtle)] text-[var(--text-tertiary)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)]"
+          title={t("Open device")}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <ExternalLink className="size-3.5" />
+        </Link>
+      </div>
+      <div className="absolute bottom-2.5 left-4 right-3 flex items-center justify-between gap-3">
+        <div className="flex max-w-[188px] flex-wrap gap-1">
+          {shownPorts.map((port) => (
+            <span
+              key={port.id}
+              className="size-1.5 rounded-[2px] border"
+              style={{
+                background: port.linked
+                  ? port.color || "var(--accent-secondary)"
+                  : "transparent",
+                borderColor: port.linked
+                  ? port.color || "var(--accent-secondary)"
+                  : "var(--border-strong)",
+              }}
+            />
+          ))}
+          {hiddenPortCount > 0 && (
+            <span className="font-mono text-[8px] text-[var(--text-muted)]">
+              +{hiddenPortCount}
+            </span>
+          )}
+        </div>
+        <span className="max-w-[78px] truncate text-right font-mono text-[8px] text-[var(--text-muted)]">
+          {data.sectionLabel}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function PhysicalDiagramDeviceCard({
+  data,
+  selected,
+}: NodeProps<DiagramDeviceNode>) {
+  const { t } = useI18n();
+  const zoom = useReactFlowStore((state) => state.transform[2]);
+  const updateNodeInternals = useUpdateNodeInternals();
+  const presentation = data.physicalPresentation!;
+  const layout = data.physicalLayout!;
+  const linkedPortIds = useMemo(
+    () => new Set(data.linkedPortIds),
+    [data.linkedPortIds],
+  );
+  const simplified = zoom < 0.68;
+  const showPortLabels = zoom >= 1.02;
+  const showSecondaryLabels = zoom >= 0.58;
+
+  useEffect(() => {
+    updateNodeInternals(data.deviceId);
+  }, [data.deviceId, presentation, updateNodeInternals]);
+
+  return (
+    <div
+      data-testid="visualizer-physical-node"
+      className={cn(
+        "relative overflow-hidden rounded-[var(--radius-md)] border bg-[var(--surface-2)] text-left shadow-[0_16px_34px_rgb(0_0_0_/_0.22)] transition-colors",
+        selected
+          ? "border-[var(--accent-primary-border)] shadow-[var(--shadow-selected)]"
+          : "border-[var(--border-default)]",
+      )}
+      style={{ width: presentation.width, height: presentation.height }}
+      title={t("{hostname}{value2}", {
+        hostname: data.hostname,
+        value2: data.address ? ` | ${data.address}` : "",
+      })}
+    >
+      <span
+        className="absolute inset-x-2 top-0 h-0.5 rounded-full"
+        style={{ background: data.stripeColor }}
+      />
+      <div
+        className="flex items-center gap-2 border-b border-[var(--border-subtle)] px-2.5"
+        style={{ height: 52 }}
+      >
+        <span
+          className="grid size-7 shrink-0 place-items-center rounded-[var(--radius-sm)] border border-[var(--border-subtle)] bg-[var(--surface-1)]"
+          style={{ color: data.typeColor }}
+        >
+          <DeviceTypeIcon type={data.deviceType} className="size-4" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="truncate text-[13px] font-semibold text-[var(--text-primary)]">
+              {data.hostname}
+            </span>
+            <StatusDot status={healthToDeviceStatus(data.health)} />
+          </div>
+          <div
+            className={cn(
+              "mt-0.5 truncate font-mono text-[9px] text-[var(--text-tertiary)] transition-opacity",
+              !showSecondaryLabels && "opacity-0",
+            )}
+          >
+            {data.address}
+          </div>
+        </div>
+        <Link
+          to={`/devices/${data.deviceId}`}
+          className="nodrag nopan grid size-7 shrink-0 place-items-center rounded-[var(--radius-sm)] border border-[var(--border-subtle)] text-[var(--text-tertiary)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)]"
+          title={t("Open device")}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <ExternalLink className="size-3.5" />
+        </Link>
+      </div>
+
+      {presentation.faces.map((frame) => (
+        <div
+          key={frame.face}
+          className="absolute"
+          style={{
+            left: 10,
+            right: 10,
+            top: frame.labelTop,
+            height: frame.height + 16,
+          }}
+        >
+          <div
+            className={cn(
+              "flex h-4 items-center justify-between font-mono text-[8px] uppercase tracking-[0.13em] text-[var(--text-muted)] transition-opacity",
+              !showSecondaryLabels && "opacity-0",
+            )}
+          >
+            <span>{frame.face === "front" ? t("Front") : t("Rear")}</span>
+            <span>{data.portSummary}</span>
+          </div>
+          <div style={{ height: frame.height }}>
+            <PhysicalFaceplate
+              layout={layout}
+              face={frame.face}
+              ports={data.physicalPorts}
+              linkedPortIds={linkedPortIds}
+              compact={!showPortLabels}
+              detail={simplified ? "simplified" : "full"}
+              fit="stretch"
+              className="h-full shadow-none"
+              style={{ borderWidth: 0 }}
+            />
+          </div>
+        </div>
+      ))}
+
+      {presentation.anchors.map((anchor) => (
+        <span key={anchor.portId}>
+          <Handle
+            type="target"
+            position={anchor.side === "left" ? Position.Left : Position.Right}
+            id={physicalPortHandleId("target", anchor.portId)}
+            data-port-id={anchor.portId}
+            className="visualizer-physical-port-handle"
+            style={physicalHandleStyle(
+              anchor.x,
+              anchor.y,
+              anchor.side === "left" ? Position.Left : Position.Right,
+            )}
+          />
+          <Handle
+            type="source"
+            position={anchor.side === "left" ? Position.Left : Position.Right}
+            id={physicalPortHandleId("source", anchor.portId)}
+            data-port-id={anchor.portId}
+            className="visualizer-physical-port-handle"
+            style={physicalHandleStyle(
+              anchor.x,
+              anchor.y,
+              anchor.side === "left" ? Position.Left : Position.Right,
+            )}
+          />
+        </span>
+      ))}
+      <Handle
+        type="target"
+        position={Position.Bottom}
+        id="target-unmapped"
+        className="visualizer-physical-port-handle"
+        style={physicalHandleStyle(
+          presentation.fallbackAnchor.x,
+          presentation.fallbackAnchor.y,
+          Position.Bottom,
+        )}
+      />
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        id="source-unmapped"
+        className="visualizer-physical-port-handle"
+        style={physicalHandleStyle(
+          presentation.fallbackAnchor.x,
+          presentation.fallbackAnchor.y,
+          Position.Bottom,
+        )}
+      />
+
+      <div
+        className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-2 border-t border-[var(--border-subtle)] px-2.5 font-mono text-[8px] uppercase tracking-[0.1em] text-[var(--text-muted)]"
+        style={{ height: 26 }}
+      >
+        <span className="truncate">{data.sectionLabel}</span>
+        <span className="shrink-0">
+          {data.connectionCount} {t("links")}
+          {presentation.unmappedPortIds.length > 0 ? (
+            <>
+              {" · "}
+              {t("Needs attention")}: {presentation.unmappedPortIds.length}
+            </>
+          ) : null}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function physicalHandleStyle(x: number, y: number, position: Position) {
+  const placement = physicalHandlePlacement(x, y, position);
+
+  return {
+    ...placement,
+    right: "auto",
+    bottom: "auto",
+    border: 0,
+    background: "transparent",
+    opacity: 0,
+    pointerEvents: "none" as const,
+    transform: "none",
+  };
+}
+
+function DiagramHandles() {
+  return (
+    <>
+      {(["Left", "Right", "Top", "Bottom"] as const).map((side) => {
+        const position = Position[side];
+        const id = side.toLowerCase();
+        return (
+          <span key={id}>
+            <Handle
+              type="target"
+              position={position}
+              id={`target-${id}`}
+              className="visualizer-diagram-handle"
+            />
+            <Handle
+              type="source"
+              position={position}
+              id={`source-${id}`}
+              className="visualizer-diagram-handle"
+            />
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
+function DiagramSectionCard({ data }: NodeProps<DiagramSectionNode>) {
+  return (
+    <div
+      className="diagram-section-card h-full w-full rounded-[var(--radius-lg)] border bg-[color-mix(in_srgb,var(--surface-2)_58%,transparent)] shadow-[0_1px_0_var(--edge-highlight)_inset]"
+      style={{
+        borderColor: "var(--border-default)",
+        boxShadow: `0 0 0 1px var(--edge-highlight) inset, 0 0 0 1px ${data.accent}22`,
+      }}
+    >
+      <div className="flex items-start justify-between gap-4 border-b border-[var(--border-subtle)] px-5 py-4">
+        <div className="min-w-0">
+          <div className="rk-kicker truncate">{data.subtitle}</div>
+          <div className="mt-1 truncate text-sm font-semibold text-[var(--text-primary)]">
+            {data.title}
+          </div>
+        </div>
+        <div
+          className="rounded-full border px-2 py-1 font-mono text-[9px] uppercase tracking-[0.12em]"
+          style={{
+            borderColor: data.accent,
+            color: data.accent,
+            background: "color-mix(in srgb, var(--surface-1) 82%, transparent)",
+          }}
+        >
+          {data.countLabel}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DiagramTypeChip({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "nodrag nopan h-7 shrink-0 rounded-[var(--radius-sm)] border px-2.5 font-mono text-[9px] uppercase tracking-[0.1em] transition-colors",
+        active
+          ? "border-[var(--accent-primary-border)] bg-[var(--accent-primary-soft)] text-[var(--accent-primary)]"
+          : "border-[var(--border-default)] bg-[color-mix(in_srgb,var(--surface-1)_68%,transparent)] text-[var(--text-secondary)] hover:border-[var(--border-strong)] hover:bg-[var(--surface-hover)] hover:text-[var(--text-primary)]",
+      )}
+    >
+      {label}
+    </button>
+  );
+}
+
+function DiagramDeviceInspector({
+  node,
+  model,
+  connectedCables,
+  virtualSwitches,
+}: {
+  node: VisualizerNode;
+  model: VisualizerModel;
+  connectedCables: VisualizerCable[];
+  virtualSwitches: VirtualSwitch[];
+}) {
+  const { t } = useI18n();
+  const physicalLayout = useStore((state) =>
+    state.physicalLayouts.find(
+      (layout) => layout.deviceId === node.device.id,
+    ),
+  );
+  const virtualRows = buildVirtualNetworkRows(node, model, virtualSwitches);
+  return (
+    <div>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="rk-kicker">{t("Device")}</div>
+        {physicalLayout?.effectiveStatus !== "accurate" && (
+          <Link to={`/devices/${node.device.id}?tab=physical`}>
+            <Badge tone="warn">
+              <AlertTriangle className="size-3" />
+              {t("Physical layout")} · {t("Needs attention")}
+            </Badge>
+          </Link>
+        )}
+      </div>
+      <div className="mt-2 flex items-start gap-3">
+        <span
+          className="grid size-9 shrink-0 place-items-center rounded-[var(--radius-sm)] border border-[var(--border-subtle)] bg-[var(--surface-1)]"
+          style={{ color: node.typeColor }}
+        >
+          <DeviceTypeIcon type={node.device.deviceType} className="size-5" />
+        </span>
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold text-[var(--text-primary)]">
+            {node.device.hostname}
+          </div>
+          <div className="mt-1 text-xs text-[var(--text-secondary)]">
+            {localizedDeviceTypeIdLabel(
+              node.device.deviceType,
+              [],
+              t,
+              model.deviceTypes.find(
+                (entry) => entry.type === node.device.deviceType,
+              )?.label ?? typeLabel(node.device.deviceType),
+            )}
+          </div>
+        </div>
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <InspectorValue
+          label={t("Address")}
+          value={formatNodeAddress(node, model, t)}
+          mono
+        />
+        <InspectorValue
+          label={t("Ports")}
+          value={`${node.portSummary.linked}/${node.portSummary.total} linked`}
+        />
+        <InspectorValue label={t("Rack")} value={node.rackName || "Loose"} />
+        <InspectorValue
+          label={t("Room")}
+          value={node.roomName || "Unassigned"}
+        />
+      </div>
+      {virtualRows.length > 0 && (
+        <div className="mt-3 rounded-[var(--radius-sm)] border border-[var(--border-subtle)] bg-[var(--surface-1)]">
+          <div className="flex items-center justify-between gap-3 border-b border-[var(--border-subtle)] px-3 py-2">
+            <div className="rk-kicker">{t("Virtual NICs")}</div>
+            <span className="font-mono text-[10px] text-[var(--text-muted)]">
+              {virtualRows.length}
+            </span>
+          </div>
+          <div className="max-h-64 overflow-y-auto p-2">
+            <div className="space-y-1.5">
+              {virtualRows.map((row) => (
+                <div
+                  key={row.id}
+                  className="rounded-[var(--radius-sm)] border border-[var(--border-subtle)] bg-[var(--surface-2)] px-2.5 py-2"
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--text-primary)]">
+                      {row.device ? (
+                        <Link
+                          to={`/devices/${row.device.id}`}
+                          className="transition-colors hover:text-[var(--accent-primary)]"
+                        >
+                          {row.device.hostname}
+                        </Link>
+                      ) : (
+                        node.device.hostname
+                      )}
+                    </span>
+                    <span className="font-mono text-[9px] uppercase text-[var(--text-muted)]">
+                      {row.role}
+                    </span>
+                  </div>
+                  <div className="mt-1 flex min-w-0 items-center gap-1.5 font-mono text-[10px] text-[var(--text-tertiary)]">
+                    {row.port ? (
+                      <Link
+                        to={`/ports?deviceId=${row.port.deviceId}&portId=${row.port.id}`}
+                        className="min-w-0 truncate text-[var(--accent-secondary)] transition-colors hover:text-[var(--accent-secondary-hover)]"
+                      >
+                        {formatPortLabel(row.port, { includeFace: true })}
+                      </Link>
+                    ) : (
+                      <span className="text-[var(--text-muted)]">
+                        {t("no NIC documented")}
+                      </span>
+                    )}
+                    <span className="text-[var(--text-muted)]">{"->"}</span>
+                    <span className="min-w-0 truncate text-[var(--text-primary)]">
+                      {row.virtualSwitch?.name ?? t("No vSwitch")}
+                    </span>
+                  </div>
+                  {row.host && row.host.id !== node.device.id && (
+                    <div className="mt-1 truncate text-[10px] text-[var(--text-muted)]">
+                      {t("Host")}{" "}
+                      <Link
+                        to={`/devices/${row.host.id}`}
+                        className="text-[var(--text-secondary)] transition-colors hover:text-[var(--accent-primary)]"
+                      >
+                        {row.host.hostname}
+                      </Link>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+      <div className="mt-3 rounded-[var(--radius-sm)] border border-[var(--border-subtle)] bg-[var(--surface-1)]">
+        <div className="flex items-center justify-between gap-3 border-b border-[var(--border-subtle)] px-3 py-2">
+          <div className="rk-kicker">{t("Connected cables")}</div>
+          <span className="font-mono text-[10px] text-[var(--text-muted)]">
+            {connectedCables.length}
+          </span>
+        </div>
+        <div className="max-h-64 overflow-y-auto p-2">
+          {connectedCables.length === 0 ? (
+            <div className="px-1 py-2 text-xs text-[var(--text-secondary)]">
+              {t("No visible cable links for the current filter.")}
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              {connectedCables.map((cable) => {
+                const peer =
+                  cable.fromDevice?.id === node.device.id
+                    ? cable.toDevice
+                    : cable.fromDevice;
+                const ownPort =
+                  cable.fromDevice?.id === node.device.id
+                    ? cable.fromPort
+                    : cable.toPort;
+                const peerPort =
+                  cable.fromDevice?.id === node.device.id
+                    ? cable.toPort
+                    : cable.fromPort;
+                return (
+                  <div
+                    key={cable.link.id}
+                    className="rounded-[var(--radius-sm)] border border-[var(--border-subtle)] bg-[var(--surface-2)] px-2.5 py-2"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span
+                        className="size-2 rounded-full"
+                        style={{ background: cable.color }}
+                      />
+                      <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--text-primary)]">
+                        {peer?.hostname ?? t("Unknown device")}
+                      </span>
+                      <span className="font-mono text-[9px] uppercase text-[var(--text-muted)]">
+                        {cable.link.cableType || t("Cable")}
+                      </span>
+                    </div>
+                    <div className="mt-1 truncate font-mono text-[10px] text-[var(--text-tertiary)]">
+                      {ownPort?.name ?? t("port")}
+                      {" -> "}
+                      {peerPort?.name ?? t("port")}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+      <Link
+        to={`/devices/${node.device.id}`}
+        className="mt-3 inline-flex h-8 items-center gap-2 rounded-[var(--radius-sm)] border border-[var(--border-default)] px-3 text-xs font-medium text-[var(--text-primary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--surface-hover)]"
+      >
+        <ExternalLink className="size-3.5" />
+        {t("Open device")}
+      </Link>
+    </div>
+  );
+}
+
+function DiagramCableInspector({ cable }: { cable: VisualizerCable }) {
+  const { t } = useI18n();
+  return (
+    <div>
+      <div className="rk-kicker">
+        {cable.logicalAggregate ? t("Aggregate port") : t("Cable")}
+      </div>
+      <div className="mt-2 flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
+        <span
+          className="inline-block size-2.5 rounded-full"
+          style={{ background: cable.color }}
+        />
+        {cable.link.cableType || t("Cable")}
+      </div>
+      <div className="mt-3 grid gap-2">
+        <InspectorValue
+          label={t("From")}
+          value={`${cable.fromDevice?.hostname ?? "Unknown"} / ${
+            cable.fromPort?.name ?? "port"
+          }`}
+        />
+        <InspectorValue
+          label={t("To")}
+          value={`${cable.toDevice?.hostname ?? "Unknown"} / ${
+            cable.toPort?.name ?? "port"
+          }`}
+        />
+        <InspectorValue label={t("Length")} value={cable.link.cableLength} />
+      </div>
+    </div>
+  );
+}
+
+function InspectorValue({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string;
+  value?: string | number | null;
+  mono?: boolean;
+}) {
+  return (
+    <div className="rounded-[var(--radius-sm)] border border-[var(--border-subtle)] bg-[var(--surface-1)] p-2">
+      <div className="rk-kicker">{label}</div>
+      <div
+        className={cn(
+          "mt-1 min-h-4 break-words text-xs text-[var(--text-primary)]",
+          mono && "font-mono",
+        )}
+      >
+        {value || "-"}
+      </div>
+    </div>
+  );
+}
+
+function buildDiagramLayout(
+  model: VisualizerModel,
+  cableType: string,
+  healthOverlay: boolean,
+  typeFilters: Set<string>,
+  savedPositions: Record<string, XYPosition>,
+  savedSectionPositions: Record<string, XYPosition>,
+  wifiContext: DiagramWifiContext,
+  nodeStyle: VisualizerDiagramNodeStyle,
+  physicalLayouts: DevicePhysicalLayout[],
+  physicalFaceMode: VisualizerRackFaceMode,
+  t: (key: TranslationKey) => string,
+): DiagramLayoutResult {
+  const visibleNodes = model.nodes.filter(
+    (node) =>
+      typeFilters.size === 0 || typeFilters.has(node.effectiveDeviceType),
+  );
+  const visibleDeviceIds = new Set(visibleNodes.map((node) => node.device.id));
+  const visibleCables = model.cables
+    .filter((cable) => cableIsVisible(cable, cableType))
+    .filter((cable) => cable.fromDevice && cable.toDevice)
+    .filter((cable) => cableHasVisibleEndpoints(cable, visibleDeviceIds));
+  const connectionCountByDeviceId = buildConnectionCounts(visibleCables);
+  const visiblePortsByDeviceId = buildVisibleCablePorts(visibleCables, model);
+  const physicalLayoutByDeviceId = new Map(
+    physicalLayouts.map((layout) => [layout.deviceId, layout]),
+  );
+  const physicalPresentationByDeviceId = new Map<
+    string,
+    PhysicalNodePresentation
+  >();
+  const nodeSizeByDeviceId = new Map<
+    string,
+    { width: number; height: number }
+  >();
+  for (const node of visibleNodes) {
+    const physicalLayout = physicalLayoutByDeviceId.get(node.device.id);
+    if (
+      nodeStyle === "physical" &&
+      physicalLayout &&
+      isRackStudioPhysicalDevice(node.device)
+    ) {
+      const presentation = buildPhysicalNodePresentation({
+        layout: physicalLayout,
+        requestedFaceMode: physicalFaceMode,
+        visiblePorts: visiblePortsByDeviceId.get(node.device.id) ?? [],
+      });
+      physicalPresentationByDeviceId.set(node.device.id, presentation);
+      nodeSizeByDeviceId.set(node.device.id, {
+        width: presentation.width,
+        height: presentation.height,
+      });
+    } else {
+      nodeSizeByDeviceId.set(node.device.id, {
+        width: DEVICE_NODE_WIDTH,
+        height: DEVICE_NODE_HEIGHT,
+      });
+    }
+  }
+  const sections = positionSections(
+    buildSections(model, wifiContext, visibleNodes),
+    savedSectionPositions,
+    nodeSizeByDeviceId,
+  );
+  const flowNodes: DiagramFlowNode[] = [];
+  const nodeGeometryById = new Map<string, DiagramNodeGeometry>();
+
+  for (const section of sections) {
+    flowNodes.push({
+      id: section.id,
+      type: "section",
+      position: { x: section.x, y: section.y },
+      data: {
+        accent: section.accent,
+        countLabel: `${section.nodes.length} device${
+          section.nodes.length === 1 ? "" : "s"
+        }`,
+        subtitle: section.subtitle,
+        title: section.title,
+      },
+      selectable: false,
+      draggable: true,
+      zIndex: 0,
+      style: {
+        width: section.width,
+        height: section.height,
+      },
+    });
+
+    section.nodes.forEach((node, index) => {
+      const position =
+        savedPositions[node.device.id] ?? sectionNodePosition(section, index);
+      const physicalLayout = physicalLayoutByDeviceId.get(node.device.id);
+      const physicalPresentation = physicalPresentationByDeviceId.get(
+        node.device.id,
+      );
+      const effectiveNodeStyle =
+        physicalLayout && physicalPresentation ? "physical" : "compact";
+      const physicalPorts = model.portsByDeviceId[node.device.id] ?? [];
+      const size = nodeSizeByDeviceId.get(node.device.id) ?? {
+        width: DEVICE_NODE_WIDTH,
+        height: DEVICE_NODE_HEIGHT,
+      };
+
+      flowNodes.push({
+        id: node.device.id,
+        type: "device",
+        position,
+        data: {
+          address: formatNodeAddress(node, model, t),
+          deviceId: node.device.id,
+          deviceType: node.device.deviceType,
+          health: node.health,
+          hostname: node.device.hostname,
+          connectionCount: connectionCountByDeviceId[node.device.id] ?? 0,
+          portSummary: `${node.portSummary.linked}/${node.portSummary.total}`,
+          ports: node.ports.map((port) => ({
+            id: port.port.id,
+            linked: port.linked,
+            color: port.color,
+          })),
+          sectionLabel: shortSectionLabel(section.title),
+          stripeColor: nodeStripeColor(node, healthOverlay),
+          typeColor: node.typeColor,
+          typeLabel: localizedDeviceTypeIdLabel(
+            node.device.deviceType,
+            [],
+            t,
+            model.deviceTypes.find(
+              (entry) => entry.type === node.device.deviceType,
+            )?.label ?? typeLabel(node.device.deviceType),
+          ),
+          nodeStyle: effectiveNodeStyle,
+          physicalLayout:
+            effectiveNodeStyle === "physical" ? physicalLayout : undefined,
+          physicalPresentation,
+          physicalPorts,
+          linkedPortIds: node.ports
+            .filter((port) => port.linked)
+            .map((port) => port.port.id),
+        },
+        zIndex: 2,
+      });
+      nodeGeometryById.set(node.device.id, {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+      });
+    });
+  }
+
+  const showLabels = visibleCables.length <= EDGE_LABEL_LIMIT;
+  const flowEdges = visibleCables.map((cable): DiagramFlowEdge => {
+    const offline = !cable.up || cable.unknown;
+    const snmpUp = cable.snmpVerified && cable.up && !offline;
+    const sourceGeometry = cable.fromDevice
+      ? nodeGeometryById.get(cable.fromDevice.id)
+      : undefined;
+    const targetGeometry = cable.toDevice
+      ? nodeGeometryById.get(cable.toDevice.id)
+      : undefined;
+    const handles = chooseEdgeHandles(sourceGeometry, targetGeometry);
+    const sourcePortId = cable.fromPort?.id ?? cable.link.fromPortId;
+    const targetPortId = cable.toPort?.id ?? cable.link.toPortId;
+    const sourcePresentation = cable.fromDevice
+      ? physicalPresentationByDeviceId.get(cable.fromDevice.id)
+      : undefined;
+    const targetPresentation = cable.toDevice
+      ? physicalPresentationByDeviceId.get(cable.toDevice.id)
+      : undefined;
+    return {
+      id: cable.link.id,
+      source: cable.fromDevice?.id ?? "",
+      sourceHandle: sourcePresentation
+        ? physicalEdgeHandle(sourcePresentation, "source", sourcePortId)
+        : `source-${handles.source}`,
+      target: cable.toDevice?.id ?? "",
+      targetHandle: targetPresentation
+        ? physicalEdgeHandle(targetPresentation, "target", targetPortId)
+        : `target-${handles.target}`,
+      type: "smoothstep",
+      data: { cableId: cable.link.id },
+      label: showLabels ? cable.link.cableType || undefined : undefined,
+      labelShowBg: true,
+      labelBgPadding: [6, 3],
+      labelBgBorderRadius: 4,
+      labelBgStyle: {
+        fill: "var(--surface-2)",
+        fillOpacity: 0.92,
+        stroke: "var(--border-subtle)",
+      },
+      labelStyle: {
+        fill: "var(--text-tertiary)",
+        fontSize: 10,
+        fontFamily: "var(--font-mono)",
+      },
+      style: {
+        stroke: cable.color,
+        strokeWidth: cable.crossZone ? 3 : snmpUp ? 2.75 : 2.25,
+        strokeOpacity: offline ? 0.38 : snmpUp ? 0.92 : 0.78,
+        strokeDasharray: cable.logicalAggregate
+          ? "3 3 10 3"
+          : offline
+            ? "8 7"
+            : undefined,
+        filter: cableNeedsContrastOutline(cable.color)
+          ? "drop-shadow(0 0 2px var(--text-primary))"
+          : undefined,
+        // Firefox: round caps on dashed strokes balloon each dash; solid edges stay round.
+        strokeLinecap: offline ? "butt" : "round",
+      },
+    };
+  });
+
+  return {
+    flowNodes,
+    flowEdges,
+    sections,
+    visibleDeviceCount: visibleNodes.length,
+    hiddenDeviceCount: model.nodes.length - visibleNodes.length,
+    visibleDeviceIds,
+    visibleCableCount: flowEdges.length,
+  };
+}
+
+function buildSections(
+  model: VisualizerModel,
+  wifiContext: DiagramWifiContext,
+  nodes: VisualizerNode[],
+) {
+  const sectionsById = new Map<string, DiagramSection>();
+
+  for (const node of [...nodes].sort(compareNodes)) {
+    const descriptor = describeSection(node, model, wifiContext);
+    const existing = sectionsById.get(descriptor.id);
+    if (existing) {
+      existing.nodes.push(node);
+      continue;
+    }
+    sectionsById.set(descriptor.id, {
+      ...descriptor,
+      nodes: [node],
+      x: 0,
+      y: 0,
+      width: 0,
+      height: 0,
+      columns: 1,
+      columnWidths: [],
+      rowHeights: [],
+    });
+  }
+
+  return [...sectionsById.values()].sort(
+    (a, b) =>
+      a.sortGroup - b.sortGroup ||
+      a.title.localeCompare(b.title, undefined, {
+        numeric: true,
+        sensitivity: "base",
+      }),
+  );
+}
+
+function describeSection(
+  node: VisualizerNode,
+  model: VisualizerModel,
+  wifiContext: DiagramWifiContext,
+) {
+  const wifiAssociation = wifiContext.associationByClientId[node.device.id];
+  if (wifiAssociation) {
+    const accessPoint = model.deviceById[wifiAssociation.apDeviceId];
+    const ssid = wifiAssociation.ssidId
+      ? wifiContext.ssidById[wifiAssociation.ssidId]
+      : undefined;
+    return {
+      id: `wifi:${wifiAssociation.apDeviceId}:${
+        wifiAssociation.ssidId ?? "unassigned"
+      }`,
+      title: ssid?.name ?? "Unassigned SSID",
+      subtitle: [
+        "WiFi",
+        accessPoint?.hostname,
+        wifiAssociation.band?.replace("ghz", " GHz"),
+      ]
+        .filter(Boolean)
+        .join(" / "),
+      accent:
+        normalizeColorToCss(ssid?.color) ??
+        (accessPoint ? typeColor(accessPoint.deviceType) : typeColor("ap")),
+      layout: "grid" as const,
+      sortGroup: 2,
+    };
+  }
+
+  const parent = node.device.parentDeviceId
+    ? model.deviceById[node.device.parentDeviceId]
+    : null;
+  if (parent) {
+    const parentNode = model.nodesByDeviceId[parent.id];
+    const parentBaseType =
+      parentNode?.effectiveDeviceType ??
+      model.effectiveDeviceTypeByDeviceId[parent.id] ??
+      parent.deviceType;
+    const parentIsRackShelf = parentBaseType === "rack_shelf";
+    return {
+      id: `parent:${parent.id}`,
+      title: parent.hostname,
+      subtitle: parentIsRackShelf
+        ? "Shelf / stacked devices"
+        : "Hosted child devices",
+      accent: parentNode?.typeColor ?? node.typeColor,
+      layout: (parentIsRackShelf ? "stack" : "grid") as "stack" | "grid",
+      sortGroup: 1,
+    };
+  }
+
+  if (node.rackId) {
+    return {
+      id: `rack:${node.rackId}`,
+      title: node.rackName || "Rack",
+      subtitle: node.roomName ? `${node.roomName} / rack` : "Rack inventory",
+      accent: "var(--accent-secondary)",
+      layout: "grid" as const,
+      sortGroup: 0,
+    };
+  }
+
+  if (node.roomId) {
+    return {
+      id: `room:${node.roomId}`,
+      title: node.roomName || "Room",
+      subtitle: "Room inventory",
+      accent: "var(--accent-primary)",
+      layout: "grid" as const,
+      sortGroup: 3,
+    };
+  }
+
+  return {
+    id: "loose",
+    title: "Loose / unassigned",
+    subtitle: "No rack or room placement",
+    accent: "var(--neutral)",
+    layout: "grid" as const,
+    sortGroup: 4,
+  };
+}
+
+function positionSections(
+  sections: DiagramSection[],
+  savedSectionPositions: Record<string, XYPosition>,
+  nodeSizeByDeviceId: Map<string, { width: number; height: number }>,
+) {
+  let x = SECTION_START_X;
+  let y = SECTION_START_Y;
+  let rowHeight = 0;
+
+  return sections.map((section) => {
+    const columns = sectionColumnCount(section);
+    const rows = Math.ceil(section.nodes.length / columns);
+    const gapY =
+      section.layout === "stack" ? STACKED_DEVICE_GAP_Y : DEVICE_GAP_Y;
+    const columnWidths = Array.from({ length: columns }, (_, column) =>
+      Math.max(
+        ...section.nodes
+          .filter((_, index) => index % columns === column)
+          .map(
+            (node) =>
+              nodeSizeByDeviceId.get(node.device.id)?.width ??
+              DEVICE_NODE_WIDTH,
+          ),
+      ),
+    );
+    const rowHeights = Array.from({ length: rows }, (_, row) =>
+      Math.max(
+        ...section.nodes
+          .slice(row * columns, row * columns + columns)
+          .map(
+            (node) =>
+              nodeSizeByDeviceId.get(node.device.id)?.height ??
+              DEVICE_NODE_HEIGHT,
+          ),
+      ),
+    );
+    const width =
+      SECTION_PADDING_X * 2 +
+      columnWidths.reduce((total, value) => total + value, 0) +
+      Math.max(0, columns - 1) * DEVICE_GAP_X;
+    const height =
+      SECTION_HEADER_HEIGHT +
+      SECTION_PADDING_BOTTOM +
+      rowHeights.reduce((total, value) => total + value, 0) +
+      Math.max(0, rows - 1) * gapY;
+
+    if (x > SECTION_START_X && x + width > ROW_MAX_WIDTH) {
+      x = SECTION_START_X;
+      y += rowHeight + SECTION_GAP_Y;
+      rowHeight = 0;
+    }
+
+    const savedPosition = savedSectionPositions[section.id];
+    const positioned = {
+      ...section,
+      x: savedPosition?.x ?? x,
+      y: savedPosition?.y ?? y,
+      width,
+      height,
+      columns,
+      columnWidths,
+      rowHeights,
+    };
+    x += width + SECTION_GAP_X;
+    rowHeight = Math.max(rowHeight, height);
+    return positioned;
+  });
+}
+
+function sectionNodePosition(section: DiagramSection, index: number) {
+  const column = index % section.columns;
+  const row = Math.floor(index / section.columns);
+  const gapY =
+    section.layout === "stack" ? STACKED_DEVICE_GAP_Y : DEVICE_GAP_Y;
+  return {
+    x:
+      section.x +
+      SECTION_PADDING_X +
+      section.columnWidths
+        .slice(0, column)
+        .reduce((total, value) => total + value, 0) +
+      column * DEVICE_GAP_X,
+    y:
+      section.y +
+      SECTION_HEADER_HEIGHT +
+      section.rowHeights
+        .slice(0, row)
+        .reduce((total, value) => total + value, 0) +
+      row * gapY,
+  };
+}
+
+function buildDiagramWifiContext(
+  wifiSsids: WifiSsid[],
+  wifiAccessPoints: WifiAccessPoint[],
+  wifiClientAssociations: WifiClientAssociation[],
+): DiagramWifiContext {
+  return {
+    accessPointByDeviceId: Object.fromEntries(
+      wifiAccessPoints.map((accessPoint) => [
+        accessPoint.deviceId,
+        accessPoint,
+      ]),
+    ),
+    associationByClientId: Object.fromEntries(
+      wifiClientAssociations.map((association) => [
+        association.clientDeviceId,
+        association,
+      ]),
+    ),
+    ssidById: Object.fromEntries(wifiSsids.map((ssid) => [ssid.id, ssid])),
+  };
+}
+
+function buildConnectionCounts(cables: VisualizerCable[]) {
+  return cables.reduce<Record<string, number>>((acc, cable) => {
+    if (cable.fromDevice) {
+      acc[cable.fromDevice.id] = (acc[cable.fromDevice.id] ?? 0) + 1;
+    }
+    if (cable.toDevice) {
+      acc[cable.toDevice.id] = (acc[cable.toDevice.id] ?? 0) + 1;
+    }
+    return acc;
+  }, {});
+}
+
+function buildVisibleCablePorts(
+  cables: VisualizerCable[],
+  model: VisualizerModel,
+) {
+  const portsByDeviceId = new Map<string, Map<string, Port>>();
+  const add = (deviceId: string | undefined, port: Port | undefined) => {
+    if (!deviceId || !port) return;
+    const ports = portsByDeviceId.get(deviceId) ?? new Map<string, Port>();
+    ports.set(port.id, port);
+    portsByDeviceId.set(deviceId, ports);
+  };
+
+  for (const cable of cables) {
+    add(
+      cable.fromDevice?.id,
+      cable.fromPort ?? model.portById[cable.link.fromPortId],
+    );
+    add(
+      cable.toDevice?.id,
+      cable.toPort ?? model.portById[cable.link.toPortId],
+    );
+  }
+
+  return new Map(
+    [...portsByDeviceId].map(([deviceId, ports]) => [
+      deviceId,
+      [...ports.values()],
+    ]),
+  );
+}
+
+function physicalEdgeHandle(
+  presentation: PhysicalNodePresentation,
+  direction: "source" | "target",
+  portId: string,
+) {
+  return presentation.anchors.some((anchor) => anchor.portId === portId)
+    ? physicalPortHandleId(direction, portId)
+    : `${direction}-unmapped`;
+}
+
+function buildVirtualNetworkRows(
+  node: VisualizerNode,
+  model: VisualizerModel,
+  virtualSwitches: VirtualSwitch[],
+): VirtualNetworkRow[] {
+  const switchesById = Object.fromEntries(
+    virtualSwitches.map((virtualSwitch) => [virtualSwitch.id, virtualSwitch]),
+  );
+  const hostSwitchIds = new Set(
+    virtualSwitches
+      .filter((virtualSwitch) => virtualSwitch.hostDeviceId === node.device.id)
+      .map((virtualSwitch) => virtualSwitch.id),
+  );
+  const rows: VirtualNetworkRow[] = [];
+  const selectedPorts = model.portsByDeviceId[node.device.id] ?? [];
+
+  selectedPorts
+    .filter((port) => port.virtualSwitchId)
+    .forEach((port) => {
+      const virtualSwitch = port.virtualSwitchId
+        ? switchesById[port.virtualSwitchId]
+        : undefined;
+      rows.push({
+        id: `own:${port.id}`,
+        device: node.device,
+        host: virtualSwitch
+          ? model.deviceById[virtualSwitch.hostDeviceId]
+          : undefined,
+        port,
+        role: ["vm", "container"].includes(node.effectiveDeviceType)
+          ? "guest nic"
+          : "uplink",
+        virtualSwitch,
+      });
+    });
+
+  const childDevices = Object.values(model.deviceById)
+    .filter((device) => device.parentDeviceId === node.device.id)
+    .filter((device) =>
+      ["vm", "container"].includes(
+        model.effectiveDeviceTypeByDeviceId[device.id] ?? device.deviceType,
+      ),
+    )
+    .sort((a, b) =>
+      a.hostname.localeCompare(b.hostname, undefined, {
+        numeric: true,
+        sensitivity: "base",
+      }),
+    );
+
+  for (const child of childDevices) {
+    const childPorts = (model.portsByDeviceId[child.id] ?? []).filter(
+      (port) =>
+        port.kind === "virtual" ||
+        (port.virtualSwitchId && hostSwitchIds.has(port.virtualSwitchId)),
+    );
+    if (childPorts.length === 0) {
+      rows.push({
+        id: `child:${child.id}:missing`,
+        device: child,
+        host: node.device,
+        role: child.deviceType,
+      });
+      continue;
+    }
+    childPorts.forEach((port) => {
+      const virtualSwitch = port.virtualSwitchId
+        ? switchesById[port.virtualSwitchId]
+        : undefined;
+      rows.push({
+        id: `child:${child.id}:${port.id}`,
+        device: child,
+        host: node.device,
+        port,
+        role: child.deviceType,
+        virtualSwitch,
+      });
+    });
+  }
+
+  return rows;
+}
+
+function chooseEdgeHandles(
+  source?: { x: number; y: number; width: number; height: number },
+  target?: { x: number; y: number; width: number; height: number },
+) {
+  if (!source || !target) {
+    return { source: "right", target: "left" };
+  }
+  const sourceCenter = {
+    x: source.x + source.width / 2,
+    y: source.y + source.height / 2,
+  };
+  const targetCenter = {
+    x: target.x + target.width / 2,
+    y: target.y + target.height / 2,
+  };
+  const dx = targetCenter.x - sourceCenter.x;
+  const dy = targetCenter.y - sourceCenter.y;
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return dx >= 0
+      ? { source: "right", target: "left" }
+      : { source: "left", target: "right" };
+  }
+  return dy >= 0
+    ? { source: "bottom", target: "top" }
+    : { source: "top", target: "bottom" };
+}
+
+function compareNodes(a: VisualizerNode, b: VisualizerNode) {
+  const roomCompare = (a.roomName || "").localeCompare(
+    b.roomName || "",
+    undefined,
+    {
+      numeric: true,
+      sensitivity: "base",
+    },
+  );
+  if (roomCompare !== 0) return roomCompare;
+  const rackCompare = (a.rackName || "").localeCompare(
+    b.rackName || "",
+    undefined,
+    {
+      numeric: true,
+      sensitivity: "base",
+    },
+  );
+  if (rackCompare !== 0) return rackCompare;
+  const startA = a.device.startU ?? -1;
+  const startB = b.device.startU ?? -1;
+  if (startA !== startB) return startB - startA;
+  const ipA = nodeSortIpValue(a);
+  const ipB = nodeSortIpValue(b);
+  if (ipA != null && ipB != null && ipA !== ipB) return ipA - ipB;
+  return a.device.hostname.localeCompare(b.device.hostname, undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+function nodeSortIpValue(node: VisualizerNode) {
+  return (
+    parseSortableIp(node.device.managementIp) ??
+    parseSortableIp(node.device.displayName) ??
+    parseSortableIp(node.device.hostname)
+  );
+}
+
+function parseSortableIp(value?: string | null) {
+  if (!value) return null;
+  const match = value.match(
+    /(?:^|[^\d])(\d{1,3})[.-](\d{1,3})[.-](\d{1,3})[.-](\d{1,3})(?:[^\d]|$)/,
+  );
+  if (!match) return null;
+  const octets = match.slice(1, 5).map(Number);
+  if (octets.some((octet) => octet < 0 || octet > 255)) return null;
+  return (
+    octets[0] * 256 ** 3 + octets[1] * 256 ** 2 + octets[2] * 256 + octets[3]
+  );
+}
+
+function sectionColumnCount(section: DiagramSection) {
+  if (section.layout === "stack") return 1;
+  if (section.nodes.length <= 1) return 1;
+  if (section.nodes.length <= 4) return 2;
+  return Math.max(2, Math.min(4, Math.ceil(Math.sqrt(section.nodes.length))));
+}
+
+function cableIsVisible(cable: VisualizerCable, cableType: string) {
+  return (
+    cableType === "all" || (cable.link.cableType || "Unknown") === cableType
+  );
+}
+
+function cableHasVisibleEndpoints(
+  cable: VisualizerCable,
+  visibleDeviceIds: Set<string>,
+) {
+  return Boolean(
+    cable.fromDevice &&
+    cable.toDevice &&
+    visibleDeviceIds.has(cable.fromDevice.id) &&
+    visibleDeviceIds.has(cable.toDevice.id),
+  );
+}
+
+function cableNeedsContrastOutline(color: string) {
+  const value = color.trim().toLowerCase();
+  return (
+    value === "black" ||
+    value === "#000" ||
+    value === "#000000" ||
+    value === "white" ||
+    value === "#fff" ||
+    value === "#ffffff"
+  );
+}
+
+function formatNodeAddress(
+  node: VisualizerNode,
+  model: VisualizerModel,
+  t: (key: TranslationKey) => string,
+) {
+  return formatDeviceAddress(
+    {
+      managementIp: node.device.managementIp,
+      macAddress: node.macAddress,
+    },
+    localizedDeviceTypeIdLabel(
+      node.device.deviceType,
+      [],
+      t,
+      model.deviceTypes.find((entry) => entry.type === node.device.deviceType)
+        ?.label ?? typeLabel(node.device.deviceType),
+    ),
+  );
+}
+
+function shortSectionLabel(label: string) {
+  return label.length > 12 ? `${label.slice(0, 11)}...` : label;
+}
+
+function healthToDeviceStatus(health: VisualizerHealth) {
+  return health === "offline" ||
+    health === "warning" ||
+    health === "online" ||
+    health === "unknown"
+    ? health
+    : "unknown";
+}
+
+function readDiagramPositions(key: string): Record<string, XYPosition> {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(key) ?? "{}");
+    if (!parsed || typeof parsed !== "object") return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([, value]) => {
+        if (!value || typeof value !== "object") return false;
+        const point = value as Partial<XYPosition>;
+        return Number.isFinite(point.x) && Number.isFinite(point.y);
+      }),
+    ) as Record<string, XYPosition>;
+  } catch {
+    return {};
+  }
+}
+
+function writeDiagramPositions(key: string, value: Record<string, XYPosition>) {
+  try {
+    if (Object.keys(value).length === 0) {
+      window.localStorage.removeItem(key);
+      return;
+    }
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Local storage can be unavailable in hardened browser profiles.
+  }
+}

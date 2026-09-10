@@ -1,0 +1,468 @@
+import { isStackType, listStackMembers, syncStackHeight, validateStackChildren } from './device-stacks.js'
+import { db } from '../db.js'
+import { getJsonSetting, putJsonSetting } from './app-settings.js'
+import { ValidationError } from './validation.js'
+
+export const BUILT_IN_DEVICE_TYPES = [
+  { id: 'switch', label: 'Switch' },
+  { id: 'switch_stack', label: 'Stacked switches', parentType: 'switch' },
+  { id: 'router', label: 'Router' },
+  { id: 'firewall', label: 'Firewall' },
+  { id: 'server', label: 'Server' },
+  { id: 'rack_shelf', label: 'Rack shelf' },
+  { id: 'ap', label: 'Access point' },
+  { id: 'endpoint', label: 'Endpoint' },
+  { id: 'vm', label: 'Virtual machine' },
+  { id: 'container', label: 'Container' },
+  { id: 'patch_panel', label: 'Patch panel' },
+  { id: 'brush_panel', label: 'Brush panel' },
+  { id: 'blanking_panel', label: 'Blanking panel' },
+  { id: 'storage', label: 'Storage' },
+  { id: 'storage_enclosure', label: 'Storage enclosure', parentType: 'storage' },
+  { id: 'pdu', label: 'PDU' },
+  { id: 'ups', label: 'UPS' },
+  { id: 'kvm', label: 'KVM' },
+  { id: 'other', label: 'Other' },
+] as const
+
+export interface DeviceTypeDefinition {
+  id: string
+  label: string
+  builtIn: boolean
+  parentType?: string | null
+  createdAt?: string
+  updatedAt?: string
+}
+
+interface DeviceTypeSettings {
+  custom: Array<{
+    id: string
+    label: string
+    parentType?: string | null
+    createdAt?: string
+    updatedAt?: string
+  }>
+}
+
+const SETTING_KEY = 'deviceTypes'
+const DEVICE_TYPE_ID_PATTERN = /^[a-z0-9][a-z0-9_]{1,47}$/
+const BUILT_IN_IDS = new Set<string>(BUILT_IN_DEVICE_TYPES.map((type) => type.id))
+
+export function normalizeDeviceTypeId(value: string) {
+  let normalized = ''
+  let pendingSeparator = false
+
+  const appendSeparator = () => {
+    pendingSeparator = normalized.length > 0
+  }
+  const appendCharacter = (character: string) => {
+    if (pendingSeparator && normalized.length > 0) normalized += '_'
+    normalized += character
+    pendingSeparator = false
+  }
+  const appendWord = (word: string) => {
+    appendSeparator()
+    for (const character of word) appendCharacter(character)
+    appendSeparator()
+  }
+
+  for (const character of value.trim().toLowerCase()) {
+    const code = character.charCodeAt(0)
+    const isAlphaNumeric =
+      (code >= 48 && code <= 57) || (code >= 97 && code <= 122)
+    if (isAlphaNumeric) {
+      appendCharacter(character)
+    } else if (character === '&') {
+      appendWord('and')
+    } else if (character !== "'") {
+      appendSeparator()
+    }
+    if (normalized.length >= 48) break
+  }
+
+  return normalized.slice(0, 48)
+}
+
+export function defaultDeviceTypeLabel(id: string) {
+  return id
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+export function validateDeviceTypeId(id: string, key = 'deviceType') {
+  const normalized = normalizeDeviceTypeId(id)
+  if (!normalized || !DEVICE_TYPE_ID_PATTERN.test(normalized)) {
+    throw new ValidationError(`${key} must contain at least two letters or numbers.`)
+  }
+  return normalized
+}
+
+function optionalParentType(value: unknown) {
+  if (value == null || value === '') return null
+  if (typeof value !== 'string') {
+    throw new ValidationError('parentType must be a string.')
+  }
+  const parentType = validateDeviceTypeId(value, 'parentType')
+  if (!BUILT_IN_IDS.has(parentType)) {
+    throw new ValidationError('parentType must be a built-in device type.')
+  }
+  return parentType
+}
+
+function parseCustomDeviceTypes(value: unknown) {
+  if (!Array.isArray(value)) return []
+
+  const seen = new Set<string>()
+  const custom: DeviceTypeSettings['custom'] = []
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue
+    const record = entry as Record<string, unknown>
+    if (typeof record.id !== 'string') continue
+    const id = normalizeDeviceTypeId(record.id)
+    if (!id || BUILT_IN_IDS.has(id) || seen.has(id)) continue
+    const label = typeof record.label === 'string' && record.label.trim()
+      ? record.label.trim().slice(0, 80)
+      : defaultDeviceTypeLabel(id)
+    const parentType =
+      typeof record.parentType === 'string' && BUILT_IN_IDS.has(normalizeDeviceTypeId(record.parentType))
+        ? normalizeDeviceTypeId(record.parentType)
+        : null
+    custom.push({
+      id,
+      label,
+      parentType,
+      createdAt: typeof record.createdAt === 'string' ? record.createdAt : undefined,
+      updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : undefined,
+    })
+    seen.add(id)
+  }
+  return custom
+}
+
+function loadDeviceTypeSettings(): DeviceTypeSettings {
+  const settings = getJsonSetting<DeviceTypeSettings>(SETTING_KEY, { custom: [] })
+  return {
+    custom: parseCustomDeviceTypes(settings.custom),
+  }
+}
+
+function saveDeviceTypeSettings(settings: DeviceTypeSettings) {
+  putJsonSetting(SETTING_KEY, {
+    custom: parseCustomDeviceTypes(settings.custom),
+  })
+}
+
+export function listDeviceTypes(): DeviceTypeDefinition[] {
+  const custom = loadDeviceTypeSettings().custom
+    .map((entry) => ({
+      ...entry,
+      builtIn: false,
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label) || a.id.localeCompare(b.id))
+
+  return [
+    ...BUILT_IN_DEVICE_TYPES.map((entry) => ({ ...entry, builtIn: true })),
+    ...custom,
+  ]
+}
+
+export function isKnownDeviceType(id: string) {
+  const normalized = normalizeDeviceTypeId(id)
+  if (BUILT_IN_IDS.has(normalized)) return true
+  if (loadDeviceTypeSettings().custom.some((entry) => entry.id === normalized)) return true
+  return listObservedDeviceTypes().includes(normalized)
+}
+
+export function deviceTypeBase(id: string) {
+  const normalized = normalizeDeviceTypeId(id)
+  const parentById = new Map(
+    listDeviceTypes().map((entry) => [entry.id, entry.parentType]),
+  )
+  const lineage = deviceTypeLineageFromParents(normalized, parentById)
+  const last = lineage.at(-1)
+  const next = last ? parentById.get(last) : null
+  return next && lineage.includes(normalizeDeviceTypeId(next))
+    ? normalized
+    : (last ?? normalized)
+}
+
+export function deviceTypeLineageFromParents(
+  id: string,
+  parentById: ReadonlyMap<string, string | null | undefined>,
+) {
+  const normalized = normalizeDeviceTypeId(id)
+  const seen = new Set<string>()
+  const lineage: string[] = []
+  let current = normalized
+  while (current && !seen.has(current)) {
+    lineage.push(current)
+    seen.add(current)
+    const parent = parentById.get(current)
+    if (!parent || parent === current) break
+    current = normalizeDeviceTypeId(parent)
+  }
+  return lineage
+}
+
+export function deviceTypeLineage(id: string) {
+  return deviceTypeLineageFromParents(
+    id,
+    new Map(listDeviceTypes().map((entry) => [entry.id, entry.parentType])),
+  )
+}
+
+export function deviceTypeMatches(
+  deviceType: string,
+  compatibleDeviceTypes: string[],
+) {
+  if (compatibleDeviceTypes.length === 0) return true
+  const compatible = new Set(compatibleDeviceTypes.map(normalizeDeviceTypeId))
+  return deviceTypeLineage(deviceType).some((candidate) =>
+    compatible.has(candidate),
+  )
+}
+
+export function requiredDeviceType(body: Record<string, unknown>, key = 'deviceType') {
+  const value = body[key]
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new ValidationError(`${key} is required.`)
+  }
+  const normalized = validateDeviceTypeId(value, key)
+  if (!isKnownDeviceType(normalized)) {
+    throw new ValidationError(`${key} must be a built-in or custom device type.`)
+  }
+  return normalized
+}
+
+export function optionalDeviceType(body: Record<string, unknown>, key = 'deviceType') {
+  if (!(key in body)) return undefined
+  if (body[key] == null) return null
+  if (typeof body[key] !== 'string') {
+    throw new ValidationError(`${key} must be a string.`)
+  }
+  const normalized = validateDeviceTypeId(String(body[key]), key)
+  if (!isKnownDeviceType(normalized)) {
+    throw new ValidationError(`${key} must be a built-in or custom device type.`)
+  }
+  return normalized
+}
+
+export function createDeviceType(input: {
+  id?: string | null
+  label: string
+  parentType?: string | null
+}) {
+  const label = input.label.trim()
+  if (!label) {
+    throw new ValidationError('Label is required.')
+  }
+  if (label.length > 80) {
+    throw new ValidationError('Label must be 80 characters or fewer.')
+  }
+
+  const id = validateDeviceTypeId(input.id?.trim() || label, 'id')
+  if (BUILT_IN_IDS.has(id)) {
+    throw new ValidationError('That device type is already built in.', 409)
+  }
+
+  const settings = loadDeviceTypeSettings()
+  if (settings.custom.some((entry) => entry.id === id)) {
+    throw new ValidationError('That device type already exists.', 409)
+  }
+
+  const now = new Date().toISOString()
+  const created = {
+    id,
+    label,
+    parentType: optionalParentType(input.parentType),
+    createdAt: now,
+    updatedAt: now,
+  }
+  db.transaction(() => {
+    saveDeviceTypeSettings({ custom: [...settings.custom, created] })
+    const observed = db.prepare('SELECT id FROM devices WHERE deviceType = ?').all(id) as Array<{ id: string }>
+    for (const device of observed) {
+      if (created.parentType === 'switch_stack') syncStackHeight(device.id)
+      validateStackChildren(device.id)
+    }
+  })()
+
+  return {
+    ...created,
+    builtIn: false,
+  } satisfies DeviceTypeDefinition
+}
+
+export function updateDeviceType(
+  id: string,
+  input: {
+    label?: string | null
+    parentType?: string | null
+  },
+) {
+  const normalizedId = validateDeviceTypeId(id, 'id')
+  if (BUILT_IN_IDS.has(normalizedId)) {
+    throw new ValidationError('Built-in device types cannot be modified.', 400)
+  }
+
+  const settings = loadDeviceTypeSettings()
+  const existingIndex = settings.custom.findIndex((entry) => entry.id === normalizedId)
+  const observed = listObservedDeviceTypes().includes(normalizedId)
+  if (existingIndex < 0 && !observed) {
+    throw new ValidationError('Device type not found.', 404)
+  }
+
+  const existing = settings.custom[existingIndex] ?? {
+    id: normalizedId,
+    label: defaultDeviceTypeLabel(normalizedId),
+    parentType: null,
+    createdAt: new Date().toISOString(),
+  }
+  const nextLabel = input.label === undefined ? existing.label : String(input.label ?? '').trim()
+  if (!nextLabel) {
+    throw new ValidationError('Label is required.')
+  }
+  if (nextLabel.length > 80) {
+    throw new ValidationError('Label must be 80 characters or fewer.')
+  }
+
+  const updated = {
+    ...existing,
+    label: nextLabel,
+    parentType:
+      input.parentType === undefined
+        ? (existing.parentType ?? null)
+        : optionalParentType(input.parentType),
+    updatedAt: new Date().toISOString(),
+  }
+  const custom =
+    existingIndex >= 0
+      ? settings.custom.map((entry, index) => (index === existingIndex ? updated : entry))
+      : [...settings.custom, updated]
+  db.transaction(() => {
+    const affected = db.prepare('SELECT id FROM devices WHERE deviceType = ?').all(normalizedId) as Array<{ id: string }>;
+    const wasStack = isStackType(normalizedId);
+    const becomesStack = updated.parentType === 'switch_stack';
+    if (wasStack && !becomesStack && affected.some(device => listStackMembers(device.id).length > 0)) throw new ValidationError('Remove stack members before changing type ancestry.', 409);
+    saveDeviceTypeSettings({ custom });
+    if (!wasStack && becomesStack) for (const device of affected) syncStackHeight(device.id);
+    for (const device of affected) validateStackChildren(device.id);
+  })()
+
+  return {
+    ...updated,
+    builtIn: false,
+  } satisfies DeviceTypeDefinition
+}
+
+export function deleteDeviceType(id: string) {
+  const normalizedId = validateDeviceTypeId(id, 'id')
+  if (BUILT_IN_IDS.has(normalizedId)) {
+    throw new ValidationError('Built-in device types cannot be deleted.', 400)
+  }
+
+  const usage = deviceTypeUsage(normalizedId)
+  if (
+    usage.devices +
+      usage.discoveredDevices +
+      usage.portTemplates +
+      usage.driveBayTemplates >
+    0
+  ) {
+    throw new ValidationError(
+      'Device type is still used by devices, discovery records, port templates, or drive-bay templates.',
+      409,
+    )
+  }
+
+  const settings = loadDeviceTypeSettings()
+  const nextCustom = settings.custom.filter((entry) => entry.id !== normalizedId)
+  if (nextCustom.length === settings.custom.length) {
+    throw new ValidationError('Device type not found.', 404)
+  }
+  saveDeviceTypeSettings({ custom: nextCustom })
+}
+
+export function listObservedDeviceTypes() {
+  return (db.prepare(`
+    SELECT DISTINCT deviceType AS id
+    FROM devices
+    WHERE deviceType IS NOT NULL AND TRIM(deviceType) != ''
+    UNION
+    SELECT DISTINCT deviceType AS id
+    FROM discoveredDevices
+    WHERE deviceType IS NOT NULL AND TRIM(deviceType) != ''
+  `).all() as Array<{ id: string }>)
+    .map((row) => normalizeDeviceTypeId(row.id))
+    .filter((id) => id && !BUILT_IN_IDS.has(id))
+}
+
+export function listDeviceTypesWithObserved(): DeviceTypeDefinition[] {
+  const listed = listDeviceTypes()
+  const known = new Set(listed.map((entry) => entry.id))
+  const observed = listObservedDeviceTypes()
+    .filter((id) => !known.has(id))
+    .map((id) => ({
+      id,
+      label: defaultDeviceTypeLabel(id),
+      builtIn: false,
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label) || a.id.localeCompare(b.id))
+
+  return [...listed, ...observed]
+}
+
+export function deviceTypeUsage(deviceType: string) {
+  const devices = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM devices
+    WHERE deviceType = ?
+  `).get(deviceType) as { count: number }
+  const discoveredDevices = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM discoveredDevices
+    WHERE deviceType = ?
+  `).get(deviceType) as { count: number }
+  const templates = db.prepare(`
+    SELECT deviceTypes
+    FROM portTemplates
+  `).all() as Array<{ deviceTypes: string }>
+  const driveBayTemplates = db.prepare(`
+    SELECT deviceTypes
+    FROM driveBayTemplates
+  `).all() as Array<{ deviceTypes: string }>
+
+  const countTemplateUsage = (rows: Array<{ deviceTypes: string }>) =>
+    rows.filter((template) => {
+      try {
+        const parsed = JSON.parse(template.deviceTypes)
+        return Array.isArray(parsed) && parsed.includes(deviceType)
+      } catch {
+        return false
+      }
+    }).length
+
+  return {
+    devices: Number(devices.count ?? 0),
+    discoveredDevices: Number(discoveredDevices.count ?? 0),
+    portTemplates: countTemplateUsage(templates),
+    driveBayTemplates: countTemplateUsage(driveBayTemplates),
+  }
+}
+
+export function listDeviceTypeUsage() {
+  return listDeviceTypesWithObserved().map((type) => {
+    const usage = deviceTypeUsage(type.id)
+    return {
+      id: type.id,
+      ...usage,
+      total:
+        usage.devices +
+        usage.discoveredDevices +
+        usage.portTemplates +
+        usage.driveBayTemplates,
+    }
+  })
+}

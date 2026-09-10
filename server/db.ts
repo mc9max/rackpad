@@ -1,0 +1,1667 @@
+import Database from "better-sqlite3";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createId } from "./lib/ids.js";
+import {
+  buildAutoPhysicalLayout,
+  portSetFingerprint,
+  reconcilePhysicalLayoutBindings,
+  type PhysicalLayoutDevice,
+  type PhysicalLayoutPort,
+  type PhysicalLayoutStatus,
+  type PortBindingV1,
+  type ResolvedPhysicalLayoutV1,
+} from "./lib/physical-layout.js";
+import { legacyShelfGeometry } from "./lib/legacy-shelf-geometry.js";
+import { CURRENT_SCHEMA_VERSION } from "./schema-version.js";
+import { upgradeLegacySecurityState } from "./lib/security-migration.js";
+
+export { CURRENT_SCHEMA_VERSION } from "./schema-version.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+export const DB_PATH =
+  process.env.DATABASE_PATH ?? path.resolve(__dirname, "../rackpad.db");
+export const db = new Database(DB_PATH);
+
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+
+const BOOTSTRAP_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS schemaVersion (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    version   INTEGER NOT NULL,
+    updatedAt TEXT NOT NULL
+  );
+`;
+
+const SCHEMA_MIGRATIONS = [
+  {
+    version: 1,
+    sql: `
+      CREATE TABLE IF NOT EXISTS labs (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        description TEXT,
+        location    TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS racks (
+        id          TEXT PRIMARY KEY,
+        labId       TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        name        TEXT NOT NULL,
+        totalU      INTEGER NOT NULL DEFAULT 42,
+        description TEXT,
+        location    TEXT,
+        notes       TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS devices (
+        id           TEXT PRIMARY KEY,
+        labId        TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        rackId       TEXT REFERENCES racks(id) ON DELETE SET NULL,
+        hostname     TEXT NOT NULL,
+        displayName  TEXT,
+        deviceType   TEXT NOT NULL,
+        manufacturer TEXT,
+        model        TEXT,
+        serial       TEXT,
+        managementIp TEXT,
+        status       TEXT NOT NULL DEFAULT 'unknown',
+        startU       INTEGER,
+        heightU      INTEGER,
+        face         TEXT,
+        tags         TEXT,
+        notes        TEXT,
+        lastSeen     TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS vlans (
+        id          TEXT PRIMARY KEY,
+        labId       TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        vlanId      INTEGER NOT NULL,
+        name        TEXT NOT NULL,
+        description TEXT,
+        color       TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS vlanRanges (
+        id        TEXT PRIMARY KEY,
+        labId     TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        name      TEXT NOT NULL,
+        startVlan INTEGER NOT NULL,
+        endVlan   INTEGER NOT NULL,
+        purpose   TEXT,
+        color     TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS ports (
+        id          TEXT PRIMARY KEY,
+        deviceId    TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        name        TEXT NOT NULL,
+        position    INTEGER NOT NULL,
+        kind        TEXT NOT NULL,
+        speed       TEXT,
+        linkState   TEXT NOT NULL DEFAULT 'unknown',
+        vlanId      TEXT REFERENCES vlans(id) ON DELETE SET NULL,
+        description TEXT,
+        face        TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS portLinks (
+        id          TEXT PRIMARY KEY,
+        fromPortId  TEXT NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
+        toPortId    TEXT NOT NULL REFERENCES ports(id) ON DELETE CASCADE,
+        cableType   TEXT,
+        cableLength TEXT,
+        color       TEXT,
+        notes       TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS subnets (
+        id          TEXT PRIMARY KEY,
+        labId       TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        cidr        TEXT NOT NULL,
+        name        TEXT NOT NULL,
+        description TEXT,
+        vlanId      TEXT REFERENCES vlans(id) ON DELETE SET NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS dhcpScopes (
+        id          TEXT PRIMARY KEY,
+        subnetId    TEXT NOT NULL REFERENCES subnets(id) ON DELETE CASCADE,
+        name        TEXT NOT NULL,
+        startIp     TEXT NOT NULL,
+        endIp       TEXT NOT NULL,
+        gateway     TEXT,
+        dnsServers  TEXT,
+        description TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS ipZones (
+        id          TEXT PRIMARY KEY,
+        subnetId    TEXT NOT NULL REFERENCES subnets(id) ON DELETE CASCADE,
+        kind        TEXT NOT NULL,
+        startIp     TEXT NOT NULL,
+        endIp       TEXT NOT NULL,
+        description TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS ipAssignments (
+        id             TEXT PRIMARY KEY,
+        subnetId       TEXT NOT NULL REFERENCES subnets(id) ON DELETE CASCADE,
+        ipAddress      TEXT NOT NULL,
+        assignmentType TEXT NOT NULL,
+        deviceId       TEXT REFERENCES devices(id) ON DELETE SET NULL,
+        portId         TEXT REFERENCES ports(id) ON DELETE SET NULL,
+        vmId           TEXT,
+        containerId    TEXT,
+        hostname       TEXT,
+        description    TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS auditLog (
+        id         TEXT PRIMARY KEY,
+        ts         TEXT NOT NULL,
+        user       TEXT NOT NULL,
+        action     TEXT NOT NULL,
+        entityType TEXT NOT NULL,
+        entityId   TEXT NOT NULL,
+        summary    TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS users (
+        id           TEXT PRIMARY KEY,
+        username     TEXT NOT NULL,
+        displayName  TEXT NOT NULL,
+        passwordHash TEXT NOT NULL,
+        role         TEXT NOT NULL,
+        disabled     INTEGER NOT NULL DEFAULT 0,
+        createdAt    TEXT NOT NULL,
+        lastLoginAt  TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS userSessions (
+        id         TEXT PRIMARY KEY,
+        userId     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        tokenHash  TEXT NOT NULL,
+        createdAt  TEXT NOT NULL,
+        expiresAt  TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS deviceMonitors (
+        id          TEXT PRIMARY KEY,
+        deviceId    TEXT NOT NULL UNIQUE REFERENCES devices(id) ON DELETE CASCADE,
+        type        TEXT NOT NULL DEFAULT 'none',
+        target      TEXT,
+        port        INTEGER,
+        path        TEXT,
+        intervalMs  INTEGER,
+        enabled     INTEGER NOT NULL DEFAULT 0,
+        lastCheckAt TEXT,
+        lastResult  TEXT,
+        lastMessage TEXT
+      );
+    `,
+  },
+  {
+    version: 2,
+    sql: `
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_vlans_lab_vlanId
+        ON vlans (labId, vlanId);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_ip_assignments_subnet_ip
+        ON ipAssignments (subnetId, ipAddress);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username
+        ON users (username);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_user_sessions_token_hash
+        ON userSessions (tokenHash);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_vlan_ranges_lab_name
+        ON vlanRanges (labId, name);
+
+      CREATE INDEX IF NOT EXISTS idx_devices_lab_id
+        ON devices (labId);
+
+      CREATE INDEX IF NOT EXISTS idx_devices_rack_id
+        ON devices (rackId);
+
+      CREATE INDEX IF NOT EXISTS idx_ports_device_id
+        ON ports (deviceId);
+
+      CREATE INDEX IF NOT EXISTS idx_port_links_from_port_id
+        ON portLinks (fromPortId);
+
+      CREATE INDEX IF NOT EXISTS idx_port_links_to_port_id
+        ON portLinks (toPortId);
+
+      CREATE INDEX IF NOT EXISTS idx_ip_assignments_device_id
+        ON ipAssignments (deviceId);
+
+      CREATE INDEX IF NOT EXISTS idx_ip_assignments_subnet_id
+        ON ipAssignments (subnetId);
+
+      CREATE INDEX IF NOT EXISTS idx_dhcp_scopes_subnet_id
+        ON dhcpScopes (subnetId);
+
+      CREATE INDEX IF NOT EXISTS idx_ip_zones_subnet_id
+        ON ipZones (subnetId);
+
+      CREATE INDEX IF NOT EXISTS idx_device_monitors_device_id
+        ON deviceMonitors (deviceId);
+    `,
+  },
+  {
+    version: 3,
+    sql: `
+      CREATE TABLE IF NOT EXISTS portTemplates (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        description TEXT NOT NULL,
+        deviceTypes TEXT NOT NULL,
+        ports       TEXT NOT NULL,
+        createdAt   TEXT NOT NULL,
+        updatedAt   TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_port_templates_name
+        ON portTemplates (name);
+    `,
+  },
+  {
+    version: 4,
+    sql: `
+      ALTER TABLE devices ADD COLUMN placement TEXT;
+      ALTER TABLE devices ADD COLUMN parentDeviceId TEXT REFERENCES devices(id) ON DELETE SET NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_devices_parent_device_id
+        ON devices (parentDeviceId);
+
+      CREATE TABLE IF NOT EXISTS discoveredDevices (
+        id              TEXT PRIMARY KEY,
+        labId           TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        ipAddress       TEXT NOT NULL,
+        hostname        TEXT,
+        displayName     TEXT,
+        deviceType      TEXT,
+        placement       TEXT,
+        source          TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'new',
+        notes           TEXT,
+        importedDeviceId TEXT REFERENCES devices(id) ON DELETE SET NULL,
+        lastSeen        TEXT,
+        lastScannedAt   TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_discovered_devices_lab_ip
+        ON discoveredDevices (labId, ipAddress);
+
+      CREATE INDEX IF NOT EXISTS idx_discovered_devices_lab_status
+        ON discoveredDevices (labId, status);
+    `,
+  },
+  {
+    version: 5,
+    sql: `
+      ALTER TABLE devices ADD COLUMN cpuCores INTEGER;
+      ALTER TABLE devices ADD COLUMN memoryGb REAL;
+      ALTER TABLE devices ADD COLUMN storageGb REAL;
+      ALTER TABLE devices ADD COLUMN specs TEXT;
+
+      ALTER TABLE discoveredDevices ADD COLUMN macAddress TEXT;
+      ALTER TABLE discoveredDevices ADD COLUMN vendor TEXT;
+
+      CREATE TABLE IF NOT EXISTS appSettings (
+        key       TEXT PRIMARY KEY,
+        value     TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    version: 6,
+    sql: `
+      ALTER TABLE deviceMonitors RENAME TO deviceMonitors_legacy;
+
+      CREATE TABLE deviceMonitors (
+        id          TEXT PRIMARY KEY,
+        deviceId    TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        name        TEXT NOT NULL DEFAULT 'Primary',
+        type        TEXT NOT NULL DEFAULT 'none',
+        target      TEXT,
+        port        INTEGER,
+        path        TEXT,
+        intervalMs  INTEGER,
+        enabled     INTEGER NOT NULL DEFAULT 0,
+        sortOrder   INTEGER NOT NULL DEFAULT 0,
+        lastCheckAt TEXT,
+        lastResult  TEXT,
+        lastMessage TEXT
+      );
+
+      INSERT INTO deviceMonitors (
+        id,
+        deviceId,
+        name,
+        type,
+        target,
+        port,
+        path,
+        intervalMs,
+        enabled,
+        sortOrder,
+        lastCheckAt,
+        lastResult,
+        lastMessage
+      )
+      SELECT
+        id,
+        deviceId,
+        'Primary',
+        type,
+        target,
+        port,
+        path,
+        intervalMs,
+        enabled,
+        0,
+        lastCheckAt,
+        lastResult,
+        lastMessage
+      FROM deviceMonitors_legacy;
+
+      DROP TABLE deviceMonitors_legacy;
+
+      CREATE INDEX IF NOT EXISTS idx_device_monitors_device_id
+        ON deviceMonitors (deviceId);
+
+      CREATE INDEX IF NOT EXISTS idx_device_monitors_device_sort
+        ON deviceMonitors (deviceId, sortOrder, name, id);
+    `,
+  },
+  {
+    version: 7,
+    sql: `
+      ALTER TABLE deviceMonitors ADD COLUMN lastAlertAt TEXT;
+    `,
+  },
+  {
+    version: 8,
+    sql: `
+      CREATE TABLE IF NOT EXISTS wifiControllers (
+        id           TEXT PRIMARY KEY,
+        labId        TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        deviceId     TEXT UNIQUE REFERENCES devices(id) ON DELETE SET NULL,
+        name         TEXT NOT NULL,
+        vendor       TEXT,
+        model        TEXT,
+        managementIp TEXT,
+        notes        TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS wifiSsids (
+        id       TEXT PRIMARY KEY,
+        labId    TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        name     TEXT NOT NULL,
+        purpose  TEXT,
+        security TEXT,
+        hidden   INTEGER NOT NULL DEFAULT 0,
+        vlanId   TEXT REFERENCES vlans(id) ON DELETE SET NULL,
+        color    TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS wifiAccessPoints (
+        deviceId         TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+        controllerId     TEXT REFERENCES wifiControllers(id) ON DELETE SET NULL,
+        location         TEXT,
+        firmwareVersion  TEXT,
+        notes            TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS wifiRadios (
+        id            TEXT PRIMARY KEY,
+        apDeviceId    TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        slotName      TEXT NOT NULL,
+        band          TEXT NOT NULL,
+        channel       TEXT NOT NULL,
+        channelWidth  TEXT,
+        txPower       TEXT,
+        notes         TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS wifiRadioSsids (
+        radioId TEXT NOT NULL REFERENCES wifiRadios(id) ON DELETE CASCADE,
+        ssidId  TEXT NOT NULL REFERENCES wifiSsids(id) ON DELETE CASCADE,
+        PRIMARY KEY (radioId, ssidId)
+      );
+
+      CREATE TABLE IF NOT EXISTS wifiClientAssociations (
+        clientDeviceId TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+        apDeviceId     TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        radioId        TEXT REFERENCES wifiRadios(id) ON DELETE SET NULL,
+        ssidId         TEXT REFERENCES wifiSsids(id) ON DELETE SET NULL,
+        band           TEXT,
+        channel        TEXT,
+        signalDbm      INTEGER,
+        lastSeen       TEXT,
+        lastRoamAt     TEXT,
+        notes          TEXT
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_wifi_controllers_lab_name
+        ON wifiControllers (labId, name);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_wifi_ssids_lab_name
+        ON wifiSsids (labId, name);
+
+      CREATE INDEX IF NOT EXISTS idx_wifi_controllers_lab_id
+        ON wifiControllers (labId);
+
+      CREATE INDEX IF NOT EXISTS idx_wifi_ssids_lab_id
+        ON wifiSsids (labId);
+
+      CREATE INDEX IF NOT EXISTS idx_wifi_access_points_controller_id
+        ON wifiAccessPoints (controllerId);
+
+      CREATE INDEX IF NOT EXISTS idx_wifi_radios_ap_device_id
+        ON wifiRadios (apDeviceId);
+
+      CREATE INDEX IF NOT EXISTS idx_wifi_radio_ssids_ssid_id
+        ON wifiRadioSsids (ssidId);
+
+      CREATE INDEX IF NOT EXISTS idx_wifi_client_associations_ap_device_id
+        ON wifiClientAssociations (apDeviceId);
+
+      CREATE INDEX IF NOT EXISTS idx_wifi_client_associations_ssid_id
+        ON wifiClientAssociations (ssidId);
+
+      CREATE INDEX IF NOT EXISTS idx_wifi_client_associations_radio_id
+        ON wifiClientAssociations (radioId);
+    `,
+  },
+  {
+    version: 9,
+    sql: `
+      ALTER TABLE ports ADD COLUMN mode TEXT NOT NULL DEFAULT 'access';
+      ALTER TABLE ports ADD COLUMN allowedVlanIds TEXT;
+    `,
+  },
+  {
+    version: 10,
+    sql: `
+      CREATE TABLE IF NOT EXISTS virtualSwitches (
+        id           TEXT PRIMARY KEY,
+        hostDeviceId TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        name         TEXT NOT NULL,
+        notes        TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_virtual_switches_host_device_id
+        ON virtualSwitches (hostDeviceId);
+
+      ALTER TABLE ports ADD COLUMN virtualSwitchId TEXT REFERENCES virtualSwitches(id) ON DELETE SET NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_ports_virtual_switch_id
+        ON ports (virtualSwitchId);
+    `,
+  },
+  {
+    version: 11,
+    sql: `
+      ALTER TABLE virtualSwitches ADD COLUMN kind TEXT NOT NULL DEFAULT 'external';
+    `,
+  },
+  {
+    version: 12,
+    sql: `
+      CREATE TABLE IF NOT EXISTS rooms (
+        id          TEXT PRIMARY KEY,
+        labId       TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        name        TEXT NOT NULL,
+        description TEXT,
+        location    TEXT,
+        notes       TEXT
+      );
+
+      ALTER TABLE racks ADD COLUMN roomId TEXT REFERENCES rooms(id) ON DELETE SET NULL;
+      ALTER TABLE devices ADD COLUMN roomId TEXT REFERENCES rooms(id) ON DELETE SET NULL;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_lab_name
+        ON rooms (labId, name);
+
+      CREATE INDEX IF NOT EXISTS idx_rooms_lab_id
+        ON rooms (labId);
+
+      CREATE INDEX IF NOT EXISTS idx_racks_room_id
+        ON racks (roomId);
+
+      CREATE INDEX IF NOT EXISTS idx_devices_room_id
+        ON devices (roomId);
+    `,
+  },
+  {
+    version: 13,
+    sql: `
+      CREATE TABLE IF NOT EXISTS oidcIdentities (
+        issuer      TEXT NOT NULL,
+        subject     TEXT NOT NULL,
+        userId      TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+        email       TEXT,
+        displayName TEXT,
+        createdAt   TEXT NOT NULL,
+        updatedAt   TEXT NOT NULL,
+        PRIMARY KEY (issuer, subject)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_oidc_identities_user_id
+        ON oidcIdentities (userId);
+    `,
+  },
+  {
+    version: 14,
+    sql: `
+      ALTER TABLE devices ADD COLUMN macAddress TEXT;
+
+      UPDATE devices
+      SET macAddress = (
+        SELECT discoveredDevices.macAddress
+        FROM discoveredDevices
+        WHERE discoveredDevices.importedDeviceId = devices.id
+          AND discoveredDevices.macAddress IS NOT NULL
+        ORDER BY discoveredDevices.lastScannedAt DESC
+        LIMIT 1
+      )
+      WHERE macAddress IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM discoveredDevices
+          WHERE discoveredDevices.importedDeviceId = devices.id
+            AND discoveredDevices.macAddress IS NOT NULL
+        );
+
+      UPDATE devices
+      SET macAddress = (
+        SELECT discoveredDevices.macAddress
+        FROM discoveredDevices
+        WHERE discoveredDevices.labId = devices.labId
+          AND discoveredDevices.ipAddress = devices.managementIp
+          AND discoveredDevices.macAddress IS NOT NULL
+        ORDER BY discoveredDevices.lastScannedAt DESC
+        LIMIT 1
+      )
+      WHERE macAddress IS NULL
+        AND managementIp IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM discoveredDevices
+          WHERE discoveredDevices.labId = devices.labId
+            AND discoveredDevices.ipAddress = devices.managementIp
+            AND discoveredDevices.macAddress IS NOT NULL
+        );
+    `,
+  },
+  {
+    version: 15,
+    sql: `
+      CREATE TABLE IF NOT EXISTS documentationPages (
+        id        TEXT PRIMARY KEY,
+        labId     TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        title     TEXT NOT NULL,
+        content   TEXT NOT NULL DEFAULT '',
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_documentation_pages_lab_id
+        ON documentationPages (labId);
+
+      CREATE INDEX IF NOT EXISTS idx_documentation_pages_lab_updated
+        ON documentationPages (labId, updatedAt DESC);
+
+      CREATE TABLE IF NOT EXISTS deviceImages (
+        id        TEXT PRIMARY KEY,
+        deviceId  TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        label     TEXT NOT NULL,
+        fileName  TEXT NOT NULL,
+        mimeType  TEXT NOT NULL,
+        dataUrl   TEXT NOT NULL,
+        notes     TEXT,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_device_images_device_id
+        ON deviceImages (deviceId);
+    `,
+  },
+  {
+    version: 16,
+    sql: `
+      CREATE TABLE IF NOT EXISTS referenceImages (
+        id         TEXT PRIMARY KEY,
+        labId      TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        entityType TEXT NOT NULL,
+        entityId   TEXT NOT NULL,
+        label      TEXT NOT NULL,
+        fileName   TEXT NOT NULL,
+        mimeType   TEXT NOT NULL,
+        dataUrl    TEXT NOT NULL,
+        face       TEXT,
+        notes      TEXT,
+        createdAt  TEXT NOT NULL,
+        updatedAt  TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_reference_images_lab_id
+        ON referenceImages (labId);
+
+      CREATE INDEX IF NOT EXISTS idx_reference_images_entity
+        ON referenceImages (entityType, entityId);
+    `,
+  },
+  {
+    version: 17,
+    sql: `
+      ALTER TABLE discoveredDevices ADD COLUMN technicalRole TEXT;
+      ALTER TABLE discoveredDevices ADD COLUMN technicalReason TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_discovered_devices_lab_technical
+        ON discoveredDevices (labId, technicalRole);
+    `,
+  },
+  {
+    version: 18,
+    sql: `
+      ALTER TABLE ipAssignments ADD COLUMN allocationMode TEXT NOT NULL DEFAULT 'static';
+      ALTER TABLE ipAssignments ADD COLUMN dhcpScopeId TEXT REFERENCES dhcpScopes(id) ON DELETE SET NULL;
+
+      ALTER TABLE devices ADD COLUMN networkMode TEXT NOT NULL DEFAULT 'normal';
+      ALTER TABLE virtualSwitches ADD COLUMN membersShareHostIp INTEGER NOT NULL DEFAULT 0;
+
+      CREATE TABLE IF NOT EXISTS deviceServices (
+        id             TEXT PRIMARY KEY,
+        deviceId       TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        name           TEXT NOT NULL,
+        serviceType    TEXT NOT NULL,
+        ipAssignmentId TEXT REFERENCES ipAssignments(id) ON DELETE SET NULL,
+        portId         TEXT REFERENCES ports(id) ON DELETE SET NULL,
+        vlanId         TEXT REFERENCES vlans(id) ON DELETE SET NULL,
+        monitorId      TEXT REFERENCES deviceMonitors(id) ON DELETE SET NULL,
+        url            TEXT,
+        notes          TEXT,
+        createdAt      TEXT NOT NULL,
+        updatedAt      TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ip_assignments_dhcp_scope_id
+        ON ipAssignments (dhcpScopeId);
+
+      CREATE INDEX IF NOT EXISTS idx_device_services_device_id
+        ON deviceServices (deviceId);
+
+      CREATE INDEX IF NOT EXISTS idx_device_services_type
+        ON deviceServices (serviceType);
+    `,
+  },
+  {
+    version: 19,
+    sql: `
+      ALTER TABLE deviceMonitors ADD COLUMN snmpVersion TEXT;
+      ALTER TABLE deviceMonitors ADD COLUMN snmpCommunity TEXT;
+      ALTER TABLE deviceMonitors ADD COLUMN snmpOid TEXT;
+      ALTER TABLE deviceMonitors ADD COLUMN snmpExpectedValue TEXT;
+    `,
+  },
+  {
+    version: 20,
+    sql: `
+      CREATE TABLE IF NOT EXISTS userLabAccess (
+        userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        labId  TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        role   TEXT NOT NULL,
+        PRIMARY KEY (userId, labId)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_user_lab_access_lab_id
+        ON userLabAccess (labId);
+
+      INSERT OR IGNORE INTO userLabAccess (userId, labId, role)
+      SELECT u.id, l.id, CASE WHEN u.role = 'viewer' THEN 'viewer' ELSE 'editor' END
+      FROM users u
+      CROSS JOIN labs l
+      WHERE u.role != 'admin';
+    `,
+  },
+  {
+    version: 21,
+    sql: `
+      ALTER TABLE deviceMonitors ADD COLUMN portId TEXT REFERENCES ports(id) ON DELETE SET NULL;
+      ALTER TABLE deviceMonitors ADD COLUMN snmpIfIndex INTEGER;
+      ALTER TABLE deviceMonitors ADD COLUMN snmpMatchMode TEXT NOT NULL DEFAULT 'equals';
+
+      ALTER TABLE ports ADD COLUMN snmpIfIndex INTEGER;
+
+      CREATE INDEX IF NOT EXISTS idx_device_monitors_port_id
+        ON deviceMonitors (portId);
+
+      CREATE INDEX IF NOT EXISTS idx_ports_snmp_if_index
+        ON ports (deviceId, snmpIfIndex);
+    `,
+  },
+  {
+    version: 22,
+    sql: `
+      CREATE TABLE IF NOT EXISTS snmpCredentials (
+        id             TEXT PRIMARY KEY,
+        labId          TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        name           TEXT NOT NULL,
+        version        TEXT NOT NULL,
+        communityEnc   TEXT,
+        v3User         TEXT,
+        v3AuthProto    TEXT,
+        v3AuthPassEnc  TEXT,
+        v3PrivProto    TEXT,
+        v3PrivPassEnc  TEXT,
+        v3Context      TEXT,
+        createdAt      TEXT NOT NULL,
+        updatedAt      TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_snmp_credentials_lab_id
+        ON snmpCredentials (labId);
+
+      ALTER TABLE devices ADD COLUMN snmpCredentialId TEXT REFERENCES snmpCredentials(id) ON DELETE SET NULL;
+      ALTER TABLE deviceMonitors ADD COLUMN snmpCredentialId TEXT REFERENCES snmpCredentials(id) ON DELETE SET NULL;
+    `,
+  },
+  {
+    version: 23,
+    sql: `
+      CREATE TABLE IF NOT EXISTS snmpTrapSources (
+        id           TEXT PRIMARY KEY,
+        labId        TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        deviceId     TEXT REFERENCES devices(id) ON DELETE SET NULL,
+        sourceIp     TEXT NOT NULL,
+        community    TEXT,
+        credentialId TEXT REFERENCES snmpCredentials(id) ON DELETE SET NULL,
+        lastTrapAt   TEXT,
+        UNIQUE(labId, sourceIp)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_snmp_trap_sources_lab_id
+        ON snmpTrapSources (labId);
+
+      CREATE INDEX IF NOT EXISTS idx_snmp_trap_sources_source_ip
+        ON snmpTrapSources (sourceIp);
+
+      CREATE TABLE IF NOT EXISTS snmpTrapLog (
+        id           TEXT PRIMARY KEY,
+        labId        TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        deviceId     TEXT REFERENCES devices(id) ON DELETE SET NULL,
+        sourceIp     TEXT NOT NULL,
+        trapOid      TEXT,
+        ifIndex      INTEGER,
+        varbindsJson TEXT,
+        resultAction TEXT NOT NULL,
+        message      TEXT NOT NULL,
+        receivedAt   TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_snmp_trap_log_lab_received
+        ON snmpTrapLog (labId, receivedAt DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_snmp_trap_log_device_received
+        ON snmpTrapLog (deviceId, receivedAt DESC);
+    `,
+  },
+  {
+    version: 24,
+    sql: `
+      ALTER TABLE discoveredDevices ADD COLUMN placementHint TEXT;
+    `,
+  },
+  {
+    version: 25,
+    sql: `
+      ALTER TABLE ports ADD COLUMN macAddress TEXT;
+    `,
+  },
+  {
+    version: 26,
+    sql: `
+      CREATE TABLE IF NOT EXISTS documentationDeviceLinks (
+        id TEXT PRIMARY KEY,
+        documentationPageId TEXT NOT NULL,
+        deviceId TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        UNIQUE(documentationPageId, deviceId),
+        FOREIGN KEY(documentationPageId) REFERENCES documentationPages(id) ON DELETE CASCADE,
+        FOREIGN KEY(deviceId) REFERENCES devices(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_documentation_device_links_page
+        ON documentationDeviceLinks (documentationPageId);
+
+      CREATE INDEX IF NOT EXISTS idx_documentation_device_links_device
+        ON documentationDeviceLinks (deviceId);
+    `,
+  },
+  {
+    version: 27,
+    sql: `
+      CREATE TABLE IF NOT EXISTS dockerImportSources (
+        id              TEXT PRIMARY KEY,
+        labId           TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        name            TEXT NOT NULL,
+        endpoint        TEXT NOT NULL,
+        tokenEnc        TEXT,
+        lastSyncAt      TEXT,
+        lastSyncStatus  TEXT,
+        lastSyncMessage TEXT,
+        createdAt       TEXT NOT NULL,
+        updatedAt       TEXT NOT NULL,
+        UNIQUE(labId, endpoint)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_docker_import_sources_lab_id
+        ON dockerImportSources (labId);
+
+      CREATE TABLE IF NOT EXISTS dockerContainerLinks (
+        deviceId       TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+        sourceId       TEXT NOT NULL REFERENCES dockerImportSources(id) ON DELETE CASCADE,
+        containerId    TEXT NOT NULL,
+        containerName  TEXT NOT NULL,
+        image          TEXT NOT NULL,
+        state          TEXT NOT NULL,
+        status         TEXT NOT NULL,
+        lastSyncedAt   TEXT,
+        createdAt      TEXT NOT NULL,
+        updatedAt      TEXT NOT NULL,
+        UNIQUE(sourceId, containerId)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_docker_container_links_source_id
+        ON dockerContainerLinks (sourceId);
+    `,
+  },
+  {
+    version: 28,
+    sql: `
+      ALTER TABLE subnets ADD COLUMN gateway TEXT;
+      ALTER TABLE subnets ADD COLUMN dnsServers TEXT;
+    `,
+  },
+  {
+    version: 29,
+    sql: `
+      CREATE TABLE IF NOT EXISTS discoveryScanSchedules (
+        id              TEXT PRIMARY KEY,
+        labId           TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        name            TEXT,
+        cidr            TEXT NOT NULL,
+        intervalMs      INTEGER NOT NULL,
+        enabled         INTEGER NOT NULL DEFAULT 1,
+        lastRunAt       TEXT,
+        lastResult      TEXT,
+        lastMessage     TEXT,
+        createdAt       TEXT NOT NULL,
+        updatedAt       TEXT NOT NULL,
+        UNIQUE(labId, cidr)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_discovery_scan_schedules_lab_id
+        ON discoveryScanSchedules (labId);
+
+      CREATE INDEX IF NOT EXISTS idx_discovery_scan_schedules_enabled
+        ON discoveryScanSchedules (enabled, lastRunAt);
+    `,
+  },
+  {
+    version: 30,
+    sql: `
+      ALTER TABLE ports ADD COLUMN portRole TEXT NOT NULL DEFAULT 'physical';
+      ALTER TABLE ports ADD COLUMN aggregatePortId TEXT REFERENCES ports(id) ON DELETE SET NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_ports_aggregate_port_id
+        ON ports (aggregatePortId);
+
+      CREATE INDEX IF NOT EXISTS idx_ports_device_role
+        ON ports (deviceId, portRole);
+    `,
+  },
+  {
+    version: 31,
+    sql: `
+      ALTER TABLE devices ADD COLUMN rackSlot TEXT NOT NULL DEFAULT 'full';
+
+      CREATE INDEX IF NOT EXISTS idx_devices_rack_slot
+        ON devices (rackId, face, rackSlot);
+    `,
+  },
+  {
+    version: 32,
+    sql: `
+      ALTER TABLE dockerImportSources ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;
+
+      CREATE INDEX IF NOT EXISTS idx_docker_import_sources_enabled
+        ON dockerImportSources (enabled, labId);
+    `,
+  },
+  {
+    version: 33,
+    sql: `
+      ALTER TABLE deviceMonitors ADD COLUMN ignoreTlsErrors INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
+  {
+    version: 34,
+    sql: `
+      ALTER TABLE devices ADD COLUMN ignoreDuplicateMac INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
+  {
+    version: 35,
+    sql: `
+      CREATE TABLE IF NOT EXISTS driveBayTemplates (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        description TEXT NOT NULL,
+        deviceTypes TEXT NOT NULL,
+        sections    TEXT NOT NULL,
+        createdAt   TEXT NOT NULL,
+        updatedAt   TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_drive_bay_templates_name
+        ON driveBayTemplates (name COLLATE NOCASE);
+
+      CREATE TABLE IF NOT EXISTS storageDrives (
+        id           TEXT PRIMARY KEY,
+        labId        TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        manufacturer TEXT,
+        model        TEXT,
+        serial       TEXT,
+        capacityGb   REAL NOT NULL,
+        interface    TEXT NOT NULL,
+        formFactor   TEXT NOT NULL,
+        notes        TEXT,
+        createdAt    TEXT NOT NULL,
+        updatedAt    TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_storage_drives_lab_id
+        ON storageDrives (labId);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_drives_lab_serial
+        ON storageDrives (labId, serial COLLATE NOCASE)
+        WHERE serial IS NOT NULL AND TRIM(serial) != '';
+
+      CREATE TABLE IF NOT EXISTS driveSlots (
+        id           TEXT PRIMARY KEY,
+        deviceId     TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        name         TEXT NOT NULL,
+        sectionName  TEXT NOT NULL,
+        sectionOrder INTEGER NOT NULL DEFAULT 0,
+        position     INTEGER NOT NULL,
+        slotType     TEXT NOT NULL,
+        face         TEXT NOT NULL,
+        layout       TEXT NOT NULL,
+        columns      INTEGER,
+        driveId      TEXT REFERENCES storageDrives(id) ON DELETE SET NULL,
+        createdAt    TEXT NOT NULL,
+        updatedAt    TEXT NOT NULL,
+        UNIQUE(deviceId, sectionName, name)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_drive_slots_device_id
+        ON driveSlots (deviceId, sectionOrder, position);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_drive_slots_drive_id
+        ON driveSlots (driveId)
+        WHERE driveId IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS storagePools (
+        id               TEXT PRIMARY KEY,
+        deviceId         TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        name             TEXT NOT NULL,
+        poolType         TEXT NOT NULL,
+        usableCapacityGb REAL NOT NULL,
+        status           TEXT NOT NULL,
+        notes            TEXT,
+        createdAt        TEXT NOT NULL,
+        updatedAt        TEXT NOT NULL,
+        UNIQUE(deviceId, name COLLATE NOCASE)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_storage_pools_device_id
+        ON storagePools (deviceId);
+
+      CREATE TABLE IF NOT EXISTS storagePoolDrives (
+        poolId    TEXT NOT NULL REFERENCES storagePools(id) ON DELETE CASCADE,
+        driveId   TEXT NOT NULL UNIQUE REFERENCES storageDrives(id) ON DELETE RESTRICT,
+        createdAt TEXT NOT NULL,
+        PRIMARY KEY (poolId, driveId)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_storage_pool_drives_pool_id
+        ON storagePoolDrives (poolId);
+    `,
+  },
+  {
+    version: 36,
+    sql: `
+      CREATE TABLE IF NOT EXISTS snmpSyncSchedules (
+        id          TEXT PRIMARY KEY,
+        labId       TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        deviceId    TEXT NOT NULL UNIQUE REFERENCES devices(id) ON DELETE CASCADE,
+        profileId   TEXT NOT NULL,
+        policy      TEXT NOT NULL DEFAULT 'merge',
+        intervalMs  INTEGER NOT NULL DEFAULT 86400000,
+        enabled     INTEGER NOT NULL DEFAULT 0,
+        lastRunAt   TEXT,
+        lastResult  TEXT,
+        lastMessage TEXT,
+        createdAt   TEXT NOT NULL,
+        updatedAt   TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_snmp_sync_schedules_lab_due
+        ON snmpSyncSchedules (labId, enabled, lastRunAt);
+    `,
+  },
+  {
+    version: 37,
+    sql: `
+      CREATE TABLE IF NOT EXISTS integrationConnections (
+        id            TEXT PRIMARY KEY,
+        labId         TEXT NOT NULL REFERENCES labs(id) ON DELETE CASCADE,
+        provider      TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        baseUrl       TEXT NOT NULL,
+        authKind      TEXT NOT NULL,
+        authId        TEXT,
+        authSecretEnc TEXT,
+        siteRef       TEXT,
+        verifyTls     INTEGER NOT NULL DEFAULT 1,
+        enabled       INTEGER NOT NULL DEFAULT 1,
+        syncVlans     INTEGER NOT NULL DEFAULT 1,
+        syncSubnets   INTEGER NOT NULL DEFAULT 1,
+        syncDhcp      INTEGER NOT NULL DEFAULT 1,
+        lastStatus    TEXT NOT NULL DEFAULT 'unknown',
+        lastCheckedAt TEXT,
+        lastError     TEXT,
+        lastSummary   TEXT,
+        createdAt     TEXT NOT NULL,
+        updatedAt     TEXT NOT NULL,
+        UNIQUE(labId, name COLLATE NOCASE)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_integration_connections_lab_provider
+        ON integrationConnections (labId, provider);
+    `,
+  },
+  {
+    version: 38,
+    sql: `
+      ALTER TABLE dockerImportSources ADD COLUMN verifyTls INTEGER NOT NULL DEFAULT 1;
+    `,
+  },
+  {
+    version: 39,
+    sql: `
+      ALTER TABLE integrationConnections ADD COLUMN autoSyncEnabled INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE integrationConnections ADD COLUMN autoSyncMode TEXT NOT NULL DEFAULT 'merge';
+      ALTER TABLE integrationConnections ADD COLUMN autoSyncCron TEXT;
+      ALTER TABLE integrationConnections ADD COLUMN autoSyncLabIds TEXT;
+      ALTER TABLE integrationConnections ADD COLUMN autoSyncFailureCount INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE integrationConnections ADD COLUMN autoSyncPausedUntil TEXT;
+      ALTER TABLE integrationConnections ADD COLUMN lastAutoSyncAt TEXT;
+      ALTER TABLE integrationConnections ADD COLUMN lastAutoSyncStatus TEXT;
+      ALTER TABLE integrationConnections ADD COLUMN lastAutoSyncMessage TEXT;
+    `,
+  },
+  {
+    version: 40,
+    sql: `
+      ALTER TABLE integrationConnections ADD COLUMN scopeRefs TEXT;
+    `,
+  },
+  {
+    version: 41,
+    sql: `
+      ALTER TABLE integrationConnections ADD COLUMN syncDevices INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE integrationConnections ADD COLUMN syncWifi INTEGER NOT NULL DEFAULT 1;
+
+      CREATE TABLE IF NOT EXISTS integrationSyncSchedules (
+        id             TEXT PRIMARY KEY,
+        connectionId   TEXT NOT NULL REFERENCES integrationConnections(id) ON DELETE CASCADE,
+        name           TEXT NOT NULL,
+        enabled        INTEGER NOT NULL DEFAULT 1,
+        mode           TEXT NOT NULL DEFAULT 'merge',
+        cron           TEXT NOT NULL,
+        labIds         TEXT,
+        failureCount   INTEGER NOT NULL DEFAULT 0,
+        pausedUntil    TEXT,
+        lastRunAt      TEXT,
+        lastRunStatus  TEXT,
+        lastRunMessage TEXT,
+        createdAt      TEXT NOT NULL,
+        updatedAt      TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_integration_sync_schedules_connection
+        ON integrationSyncSchedules (connectionId, enabled);
+
+      INSERT INTO integrationSyncSchedules (
+        id, connectionId, name, enabled, mode, cron, labIds,
+        failureCount, pausedUntil, lastRunAt, lastRunStatus, lastRunMessage,
+        createdAt, updatedAt
+      )
+      SELECT
+        'intsch_' || id, id, 'Default schedule', autoSyncEnabled, autoSyncMode,
+        autoSyncCron, autoSyncLabIds, autoSyncFailureCount, autoSyncPausedUntil,
+        lastAutoSyncAt, lastAutoSyncStatus, lastAutoSyncMessage,
+        createdAt, updatedAt
+      FROM integrationConnections
+      WHERE autoSyncCron IS NOT NULL;
+    `,
+  },
+  {
+    version: 42,
+    sql: `
+      ALTER TABLE integrationConnections ADD COLUMN syncSwitches INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE integrationConnections ADD COLUMN syncGateways INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE integrationConnections ADD COLUMN syncAccessPoints INTEGER NOT NULL DEFAULT 1;
+
+      UPDATE integrationConnections
+      SET syncSwitches = syncDevices,
+          syncGateways = syncDevices,
+          syncAccessPoints = syncDevices;
+    `,
+  },
+  {
+    version: 43,
+    sql: `
+      ALTER TABLE integrationConnections ADD COLUMN syncHosts INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE integrationConnections ADD COLUMN syncGuests INTEGER NOT NULL DEFAULT 1;
+    `,
+  },
+  {
+    version: 44,
+    sql: `
+      -- Earlier development builds used "skip" for drift-only behavior and
+      -- "overwrite" for create/update without deletes. Preserve those
+      -- semantics under the final merge/skip names.
+      UPDATE integrationSyncSchedules SET mode = 'merge' WHERE mode = 'skip';
+      UPDATE integrationSyncSchedules SET mode = 'skip' WHERE mode = 'overwrite';
+    `,
+  },
+  {
+    version: 45,
+    sql: `
+      -- Mirror remains unavailable until controller provenance is durable.
+      UPDATE integrationSyncSchedules SET mode = 'skip' WHERE mode = 'mirror';
+      UPDATE integrationConnections SET autoSyncMode = 'skip' WHERE autoSyncMode = 'mirror';
+    `,
+  },
+  {
+    version: 46,
+    sql: `
+      CREATE TABLE hardwareTemplates (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL COLLATE NOCASE,
+        description TEXT NOT NULL,
+        category    TEXT NOT NULL,
+        deviceTypes TEXT NOT NULL,
+        definition  TEXT NOT NULL,
+        createdAt   TEXT NOT NULL,
+        updatedAt   TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX idx_hardware_templates_name
+        ON hardwareTemplates (name COLLATE NOCASE);
+
+      CREATE TABLE hardwareTemplateDefaults (
+        deviceType TEXT PRIMARY KEY,
+        templateId TEXT NOT NULL,
+        updatedAt  TEXT NOT NULL
+      );
+
+      CREATE TABLE devicePhysicalLayouts (
+        deviceId        TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+        sourceTemplateId TEXT,
+        status          TEXT NOT NULL CHECK (
+          status IN ('accurate', 'legacy-default', 'generic-default', 'needs-mapping', 'invalid')
+        ),
+        snapshot        TEXT NOT NULL,
+        bindings        TEXT NOT NULL,
+        portFingerprint TEXT NOT NULL,
+        createdAt       TEXT NOT NULL,
+        updatedAt       TEXT NOT NULL
+      );
+
+      CREATE INDEX idx_device_physical_layouts_template
+        ON devicePhysicalLayouts (sourceTemplateId);
+
+      ALTER TABLE devices ADD COLUMN rackMountKind TEXT NOT NULL DEFAULT 'direct';
+      ALTER TABLE devices ADD COLUMN rackColumn INTEGER;
+      ALTER TABLE devices ADD COLUMN rackColumnSpan INTEGER;
+      ALTER TABLE devices ADD COLUMN shelfX REAL;
+      ALTER TABLE devices ADD COLUMN shelfY REAL;
+      ALTER TABLE devices ADD COLUMN shelfWidth REAL;
+      ALTER TABLE devices ADD COLUMN shelfHeight REAL;
+      ALTER TABLE devices ADD COLUMN shelfOrientation INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE devices ADD COLUMN rackSide TEXT;
+
+      UPDATE devices
+      SET rackColumn = CASE rackSlot WHEN 'right' THEN 6 ELSE 0 END,
+          rackColumnSpan = CASE rackSlot
+            WHEN 'left' THEN 6
+            WHEN 'right' THEN 6
+            ELSE 12
+          END,
+          rackMountKind = CASE placement WHEN 'shelf' THEN 'shelf' ELSE 'direct' END;
+    `,
+    run: () => {
+      const devices = db
+        .prepare(
+          "SELECT id, deviceType, heightU, rackSlot, placement FROM devices ORDER BY id",
+        )
+        .all() as PhysicalLayoutDevice[];
+      const selectPorts = db.prepare(
+        `
+          SELECT id, name, position, kind, face, portRole
+          FROM ports
+          WHERE deviceId = ?
+          ORDER BY position, id
+        `,
+      );
+      const insertLayout = db.prepare(
+        `
+          INSERT INTO devicePhysicalLayouts
+            (deviceId, sourceTemplateId, status, snapshot, bindings, portFingerprint, createdAt, updatedAt)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+      );
+      const now = new Date().toISOString();
+
+      for (const device of devices) {
+        const ports = selectPorts.all(device.id) as PhysicalLayoutPort[];
+        const layout = buildAutoPhysicalLayout(device, ports, "legacy");
+        insertLayout.run(
+          device.id,
+          layout.snapshot.sourceTemplateId,
+          layout.status,
+          JSON.stringify(layout.snapshot),
+          JSON.stringify(layout.bindings),
+          portSetFingerprint(ports),
+          now,
+          now,
+        );
+      }
+    },
+  },
+  {
+    version: 47,
+    sql: `
+      ALTER TABLE racks ADD COLUMN studioX REAL;
+      ALTER TABLE racks ADD COLUMN studioY REAL;
+    `,
+    run: () => {
+      const shelfIndexes = new Map<string, number>();
+      const children = db
+        .prepare(
+          `
+            SELECT id, parentDeviceId
+            FROM devices
+            WHERE placement = 'shelf'
+              AND parentDeviceId IS NOT NULL
+            ORDER BY parentDeviceId, id
+          `,
+        )
+        .all() as Array<{ id: string; parentDeviceId: string }>;
+      const shelfCounts = new Map<string, number>();
+      for (const child of children) {
+        shelfCounts.set(
+          child.parentDeviceId,
+          (shelfCounts.get(child.parentDeviceId) ?? 0) + 1,
+        );
+      }
+      const update = db.prepare(
+        `
+          UPDATE devices
+          SET shelfX = COALESCE(shelfX, ?),
+              shelfY = COALESCE(shelfY, ?),
+              shelfWidth = COALESCE(shelfWidth, ?),
+              shelfHeight = COALESCE(shelfHeight, ?),
+              shelfOrientation = COALESCE(shelfOrientation, 0)
+          WHERE id = ?
+        `,
+      );
+      for (const child of children) {
+        const index = shelfIndexes.get(child.parentDeviceId) ?? 0;
+        shelfIndexes.set(child.parentDeviceId, index + 1);
+        const geometry = legacyShelfGeometry(
+          index,
+          shelfCounts.get(child.parentDeviceId) ?? 1,
+        );
+        update.run(
+          geometry.x,
+          geometry.y,
+          geometry.width,
+          geometry.height,
+          child.id,
+        );
+      }
+    },
+  },
+  {
+    version: 48,
+    sql: `
+      ALTER TABLE portLinks ADD COLUMN label TEXT;
+      ALTER TABLE portLinks ADD COLUMN visible INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE portLinks ADD COLUMN routeWaypoints TEXT NOT NULL DEFAULT '[]';
+    `,
+  },
+  {
+    version: 49,
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_devices_rack_mount_kind
+        ON devices (rackId, rackMountKind);
+    `,
+  },
+  {
+    version: 50,
+    sql: `
+      ALTER TABLE deviceMonitors ADD COLUMN snmpCommunityEnc TEXT;
+      ALTER TABLE oidcIdentities ADD COLUMN roleRecheckRequired INTEGER NOT NULL DEFAULT 0 CHECK (roleRecheckRequired IN (0, 1));
+    `,
+    run() {
+      upgradeLegacySecurityState(db);
+    },
+  },
+  {
+    version: 51,
+    sql: `
+      CREATE TABLE deviceStackMembers (
+        id TEXT PRIMARY KEY,
+        deviceId TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        name TEXT NOT NULL,
+        manufacturer TEXT, model TEXT, serial TEXT,
+        heightU INTEGER NOT NULL CHECK (heightU BETWEEN 1 AND 20),
+        status TEXT NOT NULL CHECK (status IN ('online','offline','warning','unknown','maintenance','unmanaged')),
+        notes TEXT,
+        UNIQUE (deviceId, position)
+      );
+      CREATE TABLE deviceStackMemberMacs (
+        memberId TEXT NOT NULL REFERENCES deviceStackMembers(id) ON DELETE CASCADE,
+        label TEXT NOT NULL,
+        macAddress TEXT NOT NULL,
+        PRIMARY KEY (memberId, macAddress)
+      );
+      ALTER TABLE ports ADD COLUMN stackMemberId TEXT REFERENCES deviceStackMembers(id) ON DELETE RESTRICT;
+      CREATE INDEX idx_ports_stack_member ON ports(stackMemberId);
+      CREATE TRIGGER ports_stack_owner_insert BEFORE INSERT ON ports
+      WHEN NEW.stackMemberId IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM deviceStackMembers WHERE id = NEW.stackMemberId AND deviceId = NEW.deviceId
+      ) BEGIN SELECT RAISE(ABORT, 'Stack member must belong to the port device.'); END;
+      CREATE TRIGGER ports_stack_owner_update BEFORE UPDATE OF stackMemberId, deviceId ON ports
+      WHEN NEW.stackMemberId IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM deviceStackMembers WHERE id = NEW.stackMemberId AND deviceId = NEW.deviceId
+      ) BEGIN SELECT RAISE(ABORT, 'Stack member must belong to the port device.'); END;
+      CREATE TRIGGER stack_member_device_immutable BEFORE UPDATE OF deviceId ON deviceStackMembers
+      WHEN NEW.deviceId != OLD.deviceId
+      BEGIN SELECT RAISE(ABORT, 'Stack member ownership is immutable.'); END;
+      CREATE TRIGGER stack_device_delete BEFORE DELETE ON devices
+      WHEN EXISTS (SELECT 1 FROM deviceStackMembers WHERE deviceId = OLD.id)
+      BEGIN DELETE FROM ports WHERE deviceId = OLD.id; END;
+      CREATE TRIGGER stack_type_guard BEFORE UPDATE OF deviceType ON devices
+      WHEN NEW.deviceType != OLD.deviceType AND EXISTS (SELECT 1 FROM deviceStackMembers WHERE deviceId = OLD.id)
+      BEGIN SELECT RAISE(ABORT, 'A populated stack cannot change type.'); END;
+      CREATE TRIGGER stack_height_guard BEFORE UPDATE OF heightU ON devices
+      WHEN EXISTS (SELECT 1 FROM deviceStackMembers WHERE deviceId = OLD.id)
+        AND NEW.heightU IS NOT (SELECT SUM(heightU) FROM deviceStackMembers WHERE deviceId = OLD.id)
+      BEGIN SELECT RAISE(ABORT, 'Stack height is derived from its members.'); END;
+    `,
+  },
+] as const;
+
+const applySchema = db.transaction(() => {
+  db.exec(BOOTSTRAP_SCHEMA_SQL);
+
+  const row = db
+    .prepare("SELECT version FROM schemaVersion WHERE id = 1")
+    .get() as { version?: number } | undefined;
+  let currentVersion = Number(row?.version ?? 0);
+
+  for (const migration of SCHEMA_MIGRATIONS) {
+    if (currentVersion >= migration.version) continue;
+    db.exec(migration.sql);
+    if ("run" in migration) migration.run();
+    const updatedAt = new Date().toISOString();
+    db.prepare(
+      `
+      INSERT INTO schemaVersion (id, version, updatedAt)
+      VALUES (1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET version = excluded.version, updatedAt = excluded.updatedAt
+    `,
+    ).run(migration.version, updatedAt);
+    currentVersion = migration.version;
+  }
+
+  if (currentVersion === 0) {
+    db.prepare(
+      `
+      INSERT INTO schemaVersion (id, version, updatedAt)
+      VALUES (1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET version = excluded.version, updatedAt = excluded.updatedAt
+    `,
+    ).run(CURRENT_SCHEMA_VERSION, new Date().toISOString());
+  }
+});
+
+applySchema();
+
+type PatchPanelPortRow = {
+  id: string;
+  deviceId: string;
+  name: string;
+  position: number;
+  kind: string;
+  speed: string | null;
+  linkState: string;
+  mode: string | null;
+  vlanId: string | null;
+  allowedVlanIds: string | null;
+  description: string | null;
+  face: string | null;
+  virtualSwitchId: string | null;
+  portRole: string | null;
+  aggregatePortId: string | null;
+  macAddress: string | null;
+};
+
+function patchPanelDeviceIdsFromStoredLineage() {
+  const parentById = new Map<string, string | null>();
+  const setting = db
+    .prepare("SELECT value FROM appSettings WHERE key = 'deviceTypes'")
+    .get() as { value?: string } | undefined;
+  if (setting?.value) {
+    try {
+      const custom = (JSON.parse(setting.value) as { custom?: unknown }).custom;
+      if (Array.isArray(custom)) {
+        for (const entry of custom) {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+            continue;
+          }
+          const record = entry as Record<string, unknown>;
+          if (typeof record.id !== "string") continue;
+          const id = record.id.trim().toLowerCase();
+          const parent =
+            typeof record.parentType === "string"
+              ? record.parentType.trim().toLowerCase()
+              : null;
+          if (id) parentById.set(id, parent || null);
+        }
+      }
+    } catch {
+      // Invalid settings are ignored by the device-type loader as well.
+    }
+  }
+
+  const includesPatchPanel = (deviceType: string) => {
+    const seen = new Set<string>();
+    let current = deviceType.trim().toLowerCase();
+    while (current && !seen.has(current)) {
+      if (current === "patch_panel") return true;
+      seen.add(current);
+      current = parentById.get(current) ?? "";
+    }
+    return false;
+  };
+
+  return (
+    db.prepare("SELECT id, deviceType FROM devices").all() as Array<{
+      id: string;
+      deviceType: string;
+    }>
+  )
+    .filter((row) => includesPatchPanel(row.deviceType))
+    .map((row) => row.id);
+}
+
+export function ensurePatchPanelPassThroughPorts(deviceIds?: string[]) {
+  const targetDeviceIds =
+    deviceIds && deviceIds.length > 0
+      ? [...new Set(deviceIds)]
+      : patchPanelDeviceIdsFromStoredLineage();
+
+  if (targetDeviceIds.length === 0) return 0;
+
+  const selectPorts = db.prepare(`
+    SELECT id, deviceId, name, position, kind, speed, linkState, mode, vlanId, allowedVlanIds, description, face, virtualSwitchId
+    FROM ports
+    WHERE deviceId = ?
+    ORDER BY position, name, id
+  `);
+  const insertPort = db.prepare(`
+    INSERT INTO ports (id, deviceId, name, position, kind, speed, linkState, mode, vlanId, allowedVlanIds, description, face, virtualSwitchId)
+    VALUES (@id, @deviceId, @name, @position, @kind, @speed, @linkState, @mode, @vlanId, @allowedVlanIds, @description, @face, @virtualSwitchId)
+  `);
+  const selectLayout = db.prepare(
+    "SELECT sourceTemplateId, status, snapshot, bindings, portFingerprint FROM devicePhysicalLayouts WHERE deviceId = ?",
+  );
+  const selectPhysicalPorts = db.prepare(`
+    SELECT id, name, position, kind, face, portRole
+    FROM ports
+    WHERE deviceId = ?
+    ORDER BY position, id
+  `);
+  const updateLayout = db.prepare(`
+    UPDATE devicePhysicalLayouts
+    SET status = ?, bindings = ?, portFingerprint = ?, updatedAt = ?
+    WHERE deviceId = ?
+  `);
+
+  const normalize = db.transaction((ids: string[]) => {
+    let createdCount = 0;
+
+    for (const deviceId of ids) {
+      const ports = selectPorts.all(deviceId) as PatchPanelPortRow[];
+      const groups = new Map<string, PatchPanelPortRow[]>();
+      let deviceChanged = false;
+
+      for (const port of ports) {
+        const key = `${port.kind}|${port.name.trim().toLowerCase()}`;
+        const group = groups.get(key);
+        if (group) {
+          group.push(port);
+        } else {
+          groups.set(key, [port]);
+        }
+      }
+
+      for (const group of groups.values()) {
+        const front = group.find((port) => port.face !== "rear");
+        const rear = group.find((port) => port.face === "rear");
+
+        if (front && !rear) {
+          insertPort.run({
+            ...front,
+            id: createId("p"),
+            face: "rear",
+            linkState: "down",
+          });
+          createdCount += 1;
+          deviceChanged = true;
+        } else if (rear && !front) {
+          insertPort.run({
+            ...rear,
+            id: createId("p"),
+            face: "front",
+            linkState: "down",
+          });
+          createdCount += 1;
+          deviceChanged = true;
+        }
+      }
+
+      if (deviceChanged) {
+        const layout = selectLayout.get(deviceId) as
+          | {
+              sourceTemplateId: string | null;
+              status: PhysicalLayoutStatus;
+              snapshot: string;
+              bindings: string;
+              portFingerprint: string;
+            }
+          | undefined;
+        if (layout) {
+          const currentPorts = selectPhysicalPorts.all(
+            deviceId,
+          ) as PhysicalLayoutPort[];
+          const reconciled = reconcilePhysicalLayoutBindings({
+            snapshot: JSON.parse(layout.snapshot) as ResolvedPhysicalLayoutV1,
+            bindings: JSON.parse(layout.bindings) as PortBindingV1[],
+            status: layout.status,
+            sourceTemplateId: layout.sourceTemplateId,
+            ports: currentPorts,
+          });
+          updateLayout.run(
+            reconciled.status,
+            JSON.stringify(reconciled.bindings),
+            reconciled.portFingerprint,
+            new Date().toISOString(),
+            deviceId,
+          );
+        }
+      }
+    }
+
+    return createdCount;
+  });
+
+  return normalize(targetDeviceIds);
+}
+
+ensurePatchPanelPassThroughPorts();
+
+export function parseRow<T extends Record<string, unknown>>(
+  row: T,
+  jsonColumns: (keyof T)[],
+): T {
+  for (const col of jsonColumns) {
+    if (typeof row[col] === "string") {
+      try {
+        (row as Record<string, unknown>)[String(col)] = JSON.parse(
+          String(row[col]),
+        );
+      } catch {
+        // Leave the raw value as-is if JSON parsing fails.
+      }
+    }
+  }
+  return row;
+}

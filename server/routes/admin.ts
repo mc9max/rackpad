@@ -1,0 +1,3235 @@
+import { validateStackIntegrity } from "../lib/stack-integrity.js";
+import { restoredMonitorCommunity } from "../lib/security-migration.js";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import type { FastifyPluginAsync } from "fastify";
+import {
+  CURRENT_SCHEMA_VERSION,
+  db,
+  ensurePatchPanelPassThroughPorts,
+  parseRow,
+} from "../db.js";
+import { requireAdmin, setBootstrapState, USER_ROLES } from "../lib/auth.js";
+import { LAB_ROLES } from "../lib/lab-access.js";
+import {
+  DEFAULT_ALERT_SETTINGS,
+  loadAlertSettings,
+  saveAlertSettings,
+  sendTestAlert,
+} from "../lib/alerts.js";
+import { createId } from "../lib/ids.js";
+import {
+  loadUiSettings,
+  normalizeLanguage,
+  saveUiSettings,
+} from "../lib/ui-settings.js";
+import {
+  asObject,
+  ensureCidr,
+  ensureIpv4,
+  optionalBoolean,
+  optionalInteger,
+  optionalString,
+  ValidationError,
+} from "../lib/validation.js";
+import { cidrContainsHostIp, cidrOverlaps, ipToInt } from "../lib/ip-cidr.js";
+import { getSubnetIntegrity } from "../lib/subnet-integrity.js";
+import { listAssignmentIntegrityIssues } from "../lib/ip-assignment-integrity.js";
+import { getSnmpProfile } from "../lib/snmp-profiles/index.js";
+import {
+  BUILT_IN_DEVICE_TYPES,
+  deviceTypeLineageFromParents,
+  normalizeDeviceTypeId,
+} from "../lib/device-types.js";
+import { monitoringOperationalStatus } from "../lib/monitoring.js";
+import { dockerSyncOperationalStatus } from "../lib/docker-import.js";
+import { discoveryOperationalStatus } from "./discovery.js";
+import { snmpSyncOperationalStatus } from "./snmp-sync.js";
+import {
+  PHYSICAL_LAYOUT_STATUSES,
+  BUILT_IN_HARDWARE_TEMPLATES,
+  buildAutoPhysicalLayout,
+  isReservedHardwareTemplateId,
+  isPhysicalLayoutPort,
+  portSetFingerprint,
+  reconcilePhysicalLayoutBindings,
+  validateHardwareTemplateV1,
+  validatePortBindingsV1,
+  validateResolvedPhysicalLayoutV1,
+  type PhysicalLayoutDevice,
+  type PhysicalLayoutPort,
+  type PhysicalLayoutStatus,
+} from "../lib/physical-layout.js";
+import { legacyShelfGeometry } from "../lib/legacy-shelf-geometry.js";
+import { parseCableRouteWaypoints } from "../lib/cable-routing.js";
+import {
+  assertRackStudioRackFootprint,
+  calculateRackStudioCanvasBounds,
+} from "../lib/rack-studio-canvas.js";
+import {
+  currentRackStudioPlacement,
+  resolveRackStudioPlacement,
+  type RackStudioDeviceRow,
+} from "../lib/rack-studio-placement.js";
+import {
+  createNativeBackup,
+  deleteNativeBackup,
+  listNativeBackups,
+  NativeBackupBusyError,
+  nativeBackupReadStream,
+  nativeBackupStatus,
+  saveNativeBackupSettings,
+} from "../lib/native-backup.js";
+
+function writeAdminAudit(user: string, action: string, summary: string) {
+  db.prepare(
+    `INSERT INTO auditLog (id, ts, user, action, entityType, entityId, summary)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    createId("a"),
+    new Date().toISOString(),
+    user,
+    action,
+    "NativeBackup",
+    createId("nb"),
+    summary,
+  );
+}
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT_DIR = path.resolve(__dirname, "../..");
+const PACKAGE_JSON_PATH = path.resolve(ROOT_DIR, "package.json");
+const APP_VERSION = readAppVersion();
+const REDACTED_ALERT_SETTING_FIELDS = [
+  "discordWebhookUrl",
+  "telegramBotToken",
+  "smtpPassword",
+] as const;
+
+function readAppVersion() {
+  try {
+    const packageJson = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8")) as {
+      version?: string;
+    };
+    return packageJson.version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
+function createBackupFilename(exportedAt: string) {
+  return `rackpad-backup-${exportedAt.replace(/[:.]/g, "-").replace("T", "_").replace("Z", "")}.json`;
+}
+
+function sanitizeBackupAppSettings(rows: Record<string, unknown>[]) {
+  return rows.map((row) => {
+    if (row.key !== "alertSettings" || typeof row.value !== "string") {
+      return row;
+    }
+
+    try {
+      const parsed = JSON.parse(row.value) as Record<string, unknown>;
+      const next = { ...DEFAULT_ALERT_SETTINGS, ...parsed };
+      for (const key of REDACTED_ALERT_SETTING_FIELDS) {
+        next[key] = null;
+      }
+      return {
+        ...row,
+        value: JSON.stringify(next),
+      };
+    } catch {
+      return row;
+    }
+  });
+}
+
+const exportBackupSnapshot = db.transaction(
+  (exportedAt: string, exportedBy: string, filename: string) => {
+    const auditId = createId("a");
+
+    const snapshot = {
+      format: "rackpad-backup-v1",
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      appVersion: APP_VERSION,
+      exportedAt,
+      exportedBy,
+      secretsRedacted: true,
+      data: {
+        labs: db.prepare("SELECT * FROM labs ORDER BY name, id").all(),
+        rooms: db.prepare("SELECT * FROM rooms ORDER BY labId, name, id").all(),
+        racks: db.prepare("SELECT * FROM racks ORDER BY name, id").all(),
+        devices: (
+          db
+            .prepare("SELECT * FROM devices ORDER BY hostname, id")
+            .all() as Record<string, unknown>[]
+        ).map((row) => parseRow(row, ["tags"])),
+        virtualSwitches: db
+          .prepare(
+            "SELECT * FROM virtualSwitches ORDER BY hostDeviceId, name, id",
+          )
+          .all(),
+        ports: (
+          db
+            .prepare("SELECT * FROM ports ORDER BY deviceId, position, id")
+            .all() as Record<string, unknown>[]
+        ).map((row) => parseRow(row, ["allowedVlanIds"])),
+        portLinks: (
+          db
+            .prepare("SELECT * FROM portLinks ORDER BY fromPortId, toPortId, id")
+            .all() as Record<string, unknown>[]
+        ).map((row) => parseRow(row, ["routeWaypoints"])),
+        portTemplates: (
+          db
+            .prepare("SELECT * FROM portTemplates ORDER BY name, id")
+            .all() as Record<string, unknown>[]
+        ).map((row) => parseRow(row, ["deviceTypes", "ports"])),
+        hardwareTemplates: (
+          db
+            .prepare("SELECT * FROM hardwareTemplates ORDER BY name, id")
+            .all() as Record<string, unknown>[]
+        ).map((row) => parseRow(row, ["deviceTypes", "definition"])),
+        hardwareTemplateDefaults: db
+          .prepare("SELECT * FROM hardwareTemplateDefaults ORDER BY deviceType")
+          .all(),
+        deviceStackMembers: db.prepare("SELECT * FROM deviceStackMembers ORDER BY deviceId, position").all(),
+        deviceStackMemberMacs: db.prepare("SELECT * FROM deviceStackMemberMacs ORDER BY memberId, macAddress").all(),
+        devicePhysicalLayouts: (
+          db
+            .prepare("SELECT * FROM devicePhysicalLayouts ORDER BY deviceId")
+            .all() as Record<string, unknown>[]
+        ).map((row) => parseRow(row, ["snapshot", "bindings"])),
+        driveBayTemplates: (
+          db
+            .prepare("SELECT * FROM driveBayTemplates ORDER BY name, id")
+            .all() as Record<string, unknown>[]
+        ).map((row) => parseRow(row, ["deviceTypes", "sections"])),
+        storageDrives: db
+          .prepare(
+            "SELECT * FROM storageDrives ORDER BY labId, manufacturer, model, id",
+          )
+          .all(),
+        driveSlots: db
+          .prepare(
+            "SELECT * FROM driveSlots ORDER BY deviceId, sectionOrder, position, id",
+          )
+          .all(),
+        storagePools: db
+          .prepare("SELECT * FROM storagePools ORDER BY deviceId, name, id")
+          .all(),
+        storagePoolDrives: db
+          .prepare(
+            "SELECT * FROM storagePoolDrives ORDER BY poolId, createdAt, driveId",
+          )
+          .all(),
+        vlans: db.prepare("SELECT * FROM vlans ORDER BY vlanId, id").all(),
+        vlanRanges: db
+          .prepare("SELECT * FROM vlanRanges ORDER BY startVlan, id")
+          .all(),
+        subnets: (
+          db.prepare("SELECT * FROM subnets ORDER BY cidr, id").all() as Record<
+            string,
+            unknown
+          >[]
+        ).map((row) => parseRow(row, ["dnsServers"])),
+        dhcpScopes: (
+          db
+            .prepare("SELECT * FROM dhcpScopes ORDER BY subnetId, name, id")
+            .all() as Record<string, unknown>[]
+        ).map((row) => parseRow(row, ["dnsServers"])),
+        ipZones: db
+          .prepare("SELECT * FROM ipZones ORDER BY subnetId, startIp, id")
+          .all(),
+        ipAssignments: db
+          .prepare(
+            "SELECT * FROM ipAssignments ORDER BY subnetId, ipAddress, id",
+          )
+          .all(),
+        discoveredDevices: db
+          .prepare(
+            "SELECT * FROM discoveredDevices ORDER BY lastScannedAt DESC, ipAddress, id",
+          )
+          .all(),
+        discoveryScanSchedules: db
+          .prepare(
+            "SELECT * FROM discoveryScanSchedules ORDER BY labId, cidr, id",
+          )
+          .all(),
+        snmpSyncSchedules: db
+          .prepare(
+            "SELECT * FROM snmpSyncSchedules ORDER BY labId, deviceId, id",
+          )
+          .all(),
+        integrationConnections: db
+          .prepare(
+            "SELECT * FROM integrationConnections ORDER BY labId, provider, name, id",
+          )
+          .all(),
+        integrationSyncSchedules: db
+          .prepare(
+            "SELECT * FROM integrationSyncSchedules ORDER BY connectionId, name, id",
+          )
+          .all(),
+        documentationPages: db
+          .prepare(
+            "SELECT * FROM documentationPages ORDER BY labId, updatedAt DESC, title, id",
+          )
+          .all(),
+        documentationDeviceLinks: db
+          .prepare(
+            "SELECT * FROM documentationDeviceLinks ORDER BY documentationPageId, deviceId, id",
+          )
+          .all(),
+        deviceImages: db
+          .prepare(
+            "SELECT * FROM deviceImages ORDER BY deviceId, createdAt DESC, id",
+          )
+          .all(),
+        referenceImages: db
+          .prepare(
+            "SELECT * FROM referenceImages ORDER BY entityType, entityId, face, createdAt DESC, id",
+          )
+          .all(),
+        auditLog: db
+          .prepare("SELECT * FROM auditLog ORDER BY ts DESC, id DESC")
+          .all(),
+        users: db
+          .prepare(
+            `
+        SELECT id, username, displayName, passwordHash, role, disabled, createdAt, lastLoginAt
+        FROM users
+        ORDER BY username, id
+      `,
+          )
+          .all(),
+        userLabAccess: db
+          .prepare(
+            "SELECT userId, labId, role FROM userLabAccess ORDER BY userId, labId",
+          )
+          .all(),
+        oidcIdentities: db
+          .prepare("SELECT * FROM oidcIdentities ORDER BY issuer, subject")
+          .all(),
+        deviceMonitors: db
+          .prepare("SELECT * FROM deviceMonitors ORDER BY deviceId, id")
+          .all(),
+        dockerImportSources: db
+          .prepare(
+            "SELECT id, labId, name, endpoint, NULL AS tokenEnc, lastSyncAt, lastSyncStatus, lastSyncMessage, createdAt, updatedAt, enabled, verifyTls FROM dockerImportSources ORDER BY labId, name, id",
+          )
+          .all(),
+        dockerContainerLinks: db
+          .prepare(
+            "SELECT * FROM dockerContainerLinks ORDER BY sourceId, containerName, deviceId",
+          )
+          .all(),
+        snmpCredentials: db
+          .prepare("SELECT * FROM snmpCredentials ORDER BY labId, name, id")
+          .all(),
+        snmpTrapSources: db
+          .prepare("SELECT * FROM snmpTrapSources ORDER BY labId, sourceIp")
+          .all(),
+        snmpTrapLog: db
+          .prepare("SELECT * FROM snmpTrapLog ORDER BY receivedAt DESC")
+          .all(),
+        deviceServices: db
+          .prepare(
+            "SELECT * FROM deviceServices ORDER BY deviceId, serviceType, name, id",
+          )
+          .all(),
+        wifiControllers: db
+          .prepare("SELECT * FROM wifiControllers ORDER BY name, id")
+          .all(),
+        wifiSsids: db
+          .prepare("SELECT * FROM wifiSsids ORDER BY name, id")
+          .all(),
+        wifiAccessPoints: db
+          .prepare("SELECT * FROM wifiAccessPoints ORDER BY deviceId")
+          .all(),
+        wifiRadios: db
+          .prepare(
+            "SELECT * FROM wifiRadios ORDER BY apDeviceId, band, slotName, id",
+          )
+          .all(),
+        wifiRadioSsids: db
+          .prepare("SELECT * FROM wifiRadioSsids ORDER BY radioId, ssidId")
+          .all(),
+        wifiClientAssociations: db
+          .prepare(
+            "SELECT * FROM wifiClientAssociations ORDER BY apDeviceId, clientDeviceId",
+          )
+          .all(),
+        appSettings: sanitizeBackupAppSettings(
+          db.prepare("SELECT * FROM appSettings ORDER BY key").all() as Record<
+            string,
+            unknown
+          >[],
+        ),
+      },
+    };
+
+    db.prepare(
+      `
+    INSERT INTO auditLog (id, ts, user, action, entityType, entityId, summary)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `,
+    ).run(
+      auditId,
+      exportedAt,
+      exportedBy,
+      "admin.export",
+      "Backup",
+      auditId,
+      `Exported Rackpad backup ${filename}`,
+    );
+
+    return snapshot;
+  },
+);
+
+function normalizeArrayRecordArray(value: unknown, key: string) {
+  if (!Array.isArray(value)) {
+    throw new ValidationError(`${key} must be an array.`);
+  }
+  return value.map((entry) => asObject(entry));
+}
+
+function parseBackupJson(value: unknown, label: string) {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    throw new ValidationError(
+      `${label} contains invalid JSON.`,
+      422,
+      "BACKUP_INTEGRITY_INVALID",
+    );
+  }
+}
+
+function validateBackupAuthorizationIntegrity(input: {
+  labs: Record<string, unknown>[];
+  users: Record<string, unknown>[];
+  userLabAccess: Record<string, unknown>[];
+}) {
+  const invalid = (
+    message: string,
+    entityType: string,
+    entityId: string,
+  ): never => {
+    throw new ValidationError(message, 422, "BACKUP_INTEGRITY_INVALID", {
+      entityType,
+      entityId,
+    });
+  };
+  const labIds = new Set(input.labs.map((row) => String(row.id ?? "")));
+  const userIds = new Set<string>();
+
+  for (const user of input.users) {
+    const userId = String(user.id ?? "");
+    const role = String(user.role ?? "");
+    if (!userId)
+      invalid("Backup user is missing an ID.", "user", "(missing id)");
+    if (userIds.has(userId)) {
+      invalid("Backup contains duplicate user IDs.", "user", userId);
+    }
+    if (!(USER_ROLES as readonly string[]).includes(role)) {
+      invalid(`Backup user ${userId} has an invalid role.`, "user", userId);
+    }
+    userIds.add(userId);
+  }
+
+  const grantKeys = new Set<string>();
+  for (const grant of input.userLabAccess) {
+    const userId = String(grant.userId ?? "");
+    const labId = String(grant.labId ?? "");
+    const role = String(grant.role ?? "");
+    const grantId = `${userId || "(missing user)"}/${labId || "(missing lab)"}`;
+    if (!userIds.has(userId)) {
+      invalid(
+        "Backup lab grant references a missing user.",
+        "userLabAccess",
+        grantId,
+      );
+    }
+    if (!labIds.has(labId)) {
+      invalid(
+        "Backup lab grant references a missing lab.",
+        "userLabAccess",
+        grantId,
+      );
+    }
+    if (!(LAB_ROLES as readonly string[]).includes(role)) {
+      invalid(
+        "Backup lab grant has an invalid role.",
+        "userLabAccess",
+        grantId,
+      );
+    }
+    const key = `${userId}\u0000${labId}`;
+    if (grantKeys.has(key)) {
+      invalid(
+        "Backup contains duplicate user/lab grants.",
+        "userLabAccess",
+        grantId,
+      );
+    }
+    grantKeys.add(key);
+  }
+}
+
+function validateBackupNetworkIntegrity(input: {
+  labs: Record<string, unknown>[];
+  rooms: Record<string, unknown>[];
+  racks: Record<string, unknown>[];
+  vlans: Record<string, unknown>[];
+  vlanRanges: Record<string, unknown>[];
+  subnets: Record<string, unknown>[];
+  dhcpScopes: Record<string, unknown>[];
+  ipZones: Record<string, unknown>[];
+  devices: Record<string, unknown>[];
+  ports: Record<string, unknown>[];
+  portLinks: Record<string, unknown>[];
+  ipAssignments: Record<string, unknown>[];
+}) {
+  function invalid(
+    message: string,
+    entityType: string,
+    entityId: string,
+    subnetId?: string,
+  ): never {
+    throw new ValidationError(message, 422, "BACKUP_INTEGRITY_INVALID", {
+      entityType,
+      entityId,
+      subnetId: subnetId ?? null,
+    });
+  }
+
+  function entityId(row: Record<string, unknown>) {
+    return String(row.id ?? "(missing id)");
+  }
+
+  function backupIpv4(
+    value: unknown,
+    label: string,
+    entityType: string,
+    id: string,
+    subnetId?: string,
+  ) {
+    try {
+      return ensureIpv4(String(value ?? ""), label);
+    } catch {
+      invalid(
+        `${label} must be a valid IPv4 address.`,
+        entityType,
+        id,
+        subnetId,
+      );
+    }
+  }
+
+  function validateHostAddress(
+    value: unknown,
+    label: string,
+    subnet: { id: string; cidr: string },
+    entityType: string,
+    id: string,
+  ) {
+    const address = backupIpv4(value, label, entityType, id, subnet.id);
+    if (!cidrContainsHostIp(subnet.cidr, address)) {
+      invalid(
+        `${label} ${address} is outside the usable host range of subnet ${subnet.cidr}.`,
+        entityType,
+        id,
+        subnet.id,
+      );
+    }
+    return address;
+  }
+
+  const labIds = new Set(input.labs.map((row) => String(row.id ?? "")));
+  const vlansById = new Map<string, { id: string; labId: string }>();
+  for (const row of input.vlans) {
+    const id = entityId(row);
+    const labId = String(row.labId ?? "");
+    if (!labIds.has(labId)) {
+      invalid("Backup VLAN references a missing lab.", "vlan", id);
+    }
+    vlansById.set(id, { id, labId });
+  }
+  for (const row of input.vlanRanges) {
+    const id = entityId(row);
+    if (!labIds.has(String(row.labId ?? ""))) {
+      invalid("Backup VLAN range references a missing lab.", "vlanRange", id);
+    }
+    const start = Number(row.startVlan);
+    const end = Number(row.endVlan);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start > end) {
+      invalid("Backup VLAN range is inverted or invalid.", "vlanRange", id);
+    }
+  }
+
+  const subnetsById = new Map<
+    string,
+    { id: string; labId: string; cidr: string; name: string }
+  >();
+  const subnetsByLab = new Map<
+    string,
+    Array<{ id: string; cidr: string; name: string }>
+  >();
+  for (const row of input.subnets) {
+    const id = String(row.id ?? "");
+    const labId = String(row.labId ?? "");
+    if (!id || !labId || !labIds.has(labId)) {
+      invalid(
+        "Backup subnet references a missing lab.",
+        "subnet",
+        id || "(missing id)",
+        id || undefined,
+      );
+    }
+    let cidr: string;
+    try {
+      cidr = ensureCidr(String(row.cidr ?? ""), "backup subnet CIDR");
+    } catch {
+      invalid("Backup subnet CIDR is invalid.", "subnet", id, id);
+    }
+    row.cidr = cidr;
+    const subnet = { id, labId, cidr, name: String(row.name ?? cidr) };
+    const vlanId = row.vlanId ? String(row.vlanId) : null;
+    if (vlanId) {
+      const vlan = vlansById.get(vlanId);
+      if (!vlan || vlan.labId !== labId) {
+        invalid(
+          "Backup subnet VLAN must belong to the same lab.",
+          "subnet",
+          id,
+          id,
+        );
+      }
+    }
+    if (row.gateway) {
+      row.gateway = validateHostAddress(
+        row.gateway,
+        "Backup subnet gateway",
+        subnet,
+        "subnet",
+        id,
+      );
+    }
+    subnetsById.set(id, subnet);
+    const list = subnetsByLab.get(labId) ?? [];
+    list.push(subnet);
+    subnetsByLab.set(labId, list);
+  }
+  for (const subnets of subnetsByLab.values()) {
+    for (let index = 0; index < subnets.length; index += 1) {
+      for (
+        let candidateIndex = index + 1;
+        candidateIndex < subnets.length;
+        candidateIndex += 1
+      ) {
+        const left = subnets[index];
+        const right = subnets[candidateIndex];
+        if (!cidrOverlaps(left.cidr, right.cidr)) continue;
+        throw new ValidationError(
+          `Backup subnets ${left.cidr} and ${right.cidr} overlap.`,
+          409,
+          "SUBNET_OVERLAP",
+          { conflicts: [left, right] },
+        );
+      }
+    }
+  }
+
+  const scopesById = new Map<
+    string,
+    { id: string; subnetId: string; startIp: string; endIp: string }
+  >();
+  for (const row of input.dhcpScopes) {
+    const id = entityId(row);
+    const subnetId = String(row.subnetId ?? "");
+    const subnet = subnetsById.get(subnetId);
+    if (!subnet)
+      invalid(
+        "Backup DHCP scope references a missing subnet.",
+        "dhcpScope",
+        id,
+        subnetId,
+      );
+    const startIp = validateHostAddress(
+      row.startIp,
+      "Backup DHCP start IP",
+      subnet,
+      "dhcpScope",
+      id,
+    );
+    const endIp = validateHostAddress(
+      row.endIp,
+      "Backup DHCP end IP",
+      subnet,
+      "dhcpScope",
+      id,
+    );
+    if (ipToInt(startIp) > ipToInt(endIp)) {
+      invalid(
+        "Backup DHCP scope range is inverted.",
+        "dhcpScope",
+        id,
+        subnetId,
+      );
+    }
+    if (row.gateway) {
+      row.gateway = validateHostAddress(
+        row.gateway,
+        "Backup DHCP gateway",
+        subnet,
+        "dhcpScope",
+        id,
+      );
+    }
+    row.startIp = startIp;
+    row.endIp = endIp;
+    scopesById.set(id, { id, subnetId, startIp, endIp });
+  }
+
+  for (const row of input.ipZones) {
+    const id = entityId(row);
+    const subnetId = String(row.subnetId ?? "");
+    const subnet = subnetsById.get(subnetId);
+    if (!subnet)
+      invalid(
+        "Backup IP zone references a missing subnet.",
+        "ipZone",
+        id,
+        subnetId,
+      );
+    const startIp = validateHostAddress(
+      row.startIp,
+      "Backup zone start IP",
+      subnet,
+      "ipZone",
+      id,
+    );
+    const endIp = validateHostAddress(
+      row.endIp,
+      "Backup zone end IP",
+      subnet,
+      "ipZone",
+      id,
+    );
+    if (ipToInt(startIp) > ipToInt(endIp)) {
+      invalid("Backup IP zone range is inverted.", "ipZone", id, subnetId);
+    }
+    row.startIp = startIp;
+    row.endIp = endIp;
+  }
+
+  const devicesById = new Map(
+    input.devices.map((row) => [
+      String(row.id),
+      { id: String(row.id), labId: String(row.labId) },
+    ]),
+  );
+  for (const device of devicesById.values()) {
+    if (!labIds.has(device.labId)) {
+      invalid("Backup device references a missing lab.", "device", device.id);
+    }
+  }
+  const portsById = new Map(
+    input.ports.map((row) => [
+      String(row.id),
+      {
+        id: String(row.id),
+        deviceId: String(row.deviceId),
+        vlanId: row.vlanId ? String(row.vlanId) : null,
+        allowedVlanIds: Array.isArray(row.allowedVlanIds)
+          ? row.allowedVlanIds.map((value) => String(value))
+          : [],
+      },
+    ]),
+  );
+  for (const port of portsById.values()) {
+    const device = devicesById.get(port.deviceId);
+    if (!device)
+      invalid("Backup port references a missing device.", "port", port.id);
+    for (const vlanId of [port.vlanId, ...port.allowedVlanIds]) {
+      if (!vlanId) continue;
+      const vlan = vlansById.get(vlanId);
+      if (!vlan || vlan.labId !== device.labId) {
+        invalid(
+          "Backup port VLAN must belong to the device lab.",
+          "port",
+          port.id,
+        );
+      }
+    }
+  }
+
+  const roomsById = new Map(
+    input.rooms.map((row) => [
+      String(row.id ?? ""),
+      { labId: String(row.labId ?? "") },
+    ]),
+  );
+  for (const [roomId, room] of roomsById) {
+    if (!roomId || !labIds.has(room.labId)) {
+      invalid("Backup room references a missing lab.", "room", roomId);
+    }
+  }
+  const roomBounds = new Map(
+    [...roomsById.keys()].map((roomId) => {
+      const roomRacks = input.racks
+        .filter((row) => String(row.roomId ?? "") === roomId)
+        .sort(
+          (left, right) =>
+            String(left.name ?? "").localeCompare(String(right.name ?? "")) ||
+            String(left.id ?? "").localeCompare(String(right.id ?? "")),
+        )
+        .map((row) => ({
+          id: String(row.id ?? ""),
+          studioY:
+            row.studioY === null || row.studioY === undefined
+              ? null
+              : Number(row.studioY),
+        }));
+      const looseDeviceCount = input.devices.filter(
+        (row) =>
+          String(row.roomId ?? "") === roomId &&
+          !row.rackId &&
+          row.placement !== "virtual" &&
+          row.placement !== "wireless",
+      ).length;
+      return [
+        roomId,
+        calculateRackStudioCanvasBounds({
+          racks: roomRacks,
+          looseDeviceCount,
+        }),
+      ];
+    }),
+  );
+
+  const linkedPortIds = new Set<string>();
+  for (const row of input.portLinks) {
+    const id = entityId(row);
+    const fromPortId = String(row.fromPortId ?? "");
+    const toPortId = String(row.toPortId ?? "");
+    const fromPort = portsById.get(fromPortId);
+    const toPort = portsById.get(toPortId);
+    const fromDevice = fromPort
+      ? devicesById.get(fromPort.deviceId)
+      : undefined;
+    const toDevice = toPort ? devicesById.get(toPort.deviceId) : undefined;
+    if (!fromPort || !toPort || !fromDevice || !toDevice) {
+      invalid("Backup cable references a missing port.", "portLink", id);
+    }
+    if (fromPortId === toPortId) {
+      invalid("Backup cable cannot link a port to itself.", "portLink", id);
+    }
+    if (linkedPortIds.has(fromPortId) || linkedPortIds.has(toPortId)) {
+      invalid(
+        "Backup cable endpoints must not be occupied by another cable.",
+        "portLink",
+        id,
+      );
+    }
+    linkedPortIds.add(fromPortId);
+    linkedPortIds.add(toPortId);
+
+    if (
+      row.visible !== undefined &&
+      row.visible !== null &&
+      row.visible !== true &&
+      row.visible !== false &&
+      row.visible !== 0 &&
+      row.visible !== 1
+    ) {
+      invalid("Backup cable visibility is invalid.", "portLink", id);
+    }
+
+    let routeWaypoints;
+    try {
+      routeWaypoints = parseCableRouteWaypoints(
+        parseBackupJson(
+          row.routeWaypoints ?? [],
+          "Backup cable route waypoints",
+        ),
+      );
+    } catch {
+      invalid("Backup cable route waypoints are invalid.", "portLink", id);
+    }
+    for (const waypoint of routeWaypoints) {
+      const room = roomsById.get(waypoint.roomId);
+      if (
+        !room ||
+        (room.labId !== fromDevice.labId && room.labId !== toDevice.labId)
+      ) {
+        invalid(
+          "Backup cable route waypoints must stay within an endpoint lab.",
+          "portLink",
+          id,
+        );
+      }
+      const bounds = roomBounds.get(waypoint.roomId);
+      if (
+        !bounds ||
+        waypoint.x > bounds.width ||
+        waypoint.y > bounds.height
+      ) {
+        invalid(
+          "Backup cable route waypoint falls outside its Rack Studio room canvas.",
+          "portLink",
+          id,
+        );
+      }
+    }
+  }
+
+  for (const assignment of input.ipAssignments) {
+    const id = entityId(assignment);
+    const subnetId = String(assignment.subnetId ?? "");
+    const subnet = subnetsById.get(subnetId);
+    if (!subnet)
+      invalid(
+        "Backup IP assignment references a missing subnet.",
+        "ipAssignment",
+        id,
+        subnetId,
+      );
+    const ipAddress = validateHostAddress(
+      assignment.ipAddress,
+      "Backup assignment IP",
+      subnet,
+      "ipAssignment",
+      id,
+    );
+    assignment.ipAddress = ipAddress;
+
+    const allocationMode = String(assignment.allocationMode ?? "static");
+    const dhcpScopeId = assignment.dhcpScopeId
+      ? String(assignment.dhcpScopeId)
+      : null;
+    if (allocationMode === "dhcp-reservation") {
+      const scope = dhcpScopeId ? scopesById.get(dhcpScopeId) : null;
+      if (!scope || scope.subnetId !== subnetId) {
+        invalid(
+          "Backup DHCP reservation must reference a scope in the same subnet.",
+          "ipAssignment",
+          id,
+          subnetId,
+        );
+      }
+      if (
+        ipToInt(ipAddress) < ipToInt(scope.startIp) ||
+        ipToInt(ipAddress) > ipToInt(scope.endIp)
+      ) {
+        invalid(
+          "Backup DHCP reservation is outside its selected scope.",
+          "ipAssignment",
+          id,
+          subnetId,
+        );
+      }
+    } else if (dhcpScopeId) {
+      invalid(
+        "Backup static assignment cannot reference a DHCP scope.",
+        "ipAssignment",
+        id,
+        subnetId,
+      );
+    }
+
+    const deviceId = assignment.deviceId ? String(assignment.deviceId) : null;
+    const portId = assignment.portId ? String(assignment.portId) : null;
+    if (deviceId) {
+      const device = devicesById.get(deviceId);
+      if (!device)
+        invalid(
+          "Backup IP assignment references a missing device.",
+          "ipAssignment",
+          id,
+          subnetId,
+        );
+      if (device.labId !== subnet.labId) {
+        invalid(
+          "Backup IP assignment references a device in another lab.",
+          "ipAssignment",
+          id,
+          subnetId,
+        );
+      }
+    }
+    if (portId) {
+      const port = portsById.get(portId);
+      const portDevice = port ? devicesById.get(port.deviceId) : null;
+      if (!port || !portDevice)
+        invalid(
+          "Backup IP assignment references a missing port.",
+          "ipAssignment",
+          id,
+          subnetId,
+        );
+      if (
+        portDevice.labId !== subnet.labId ||
+        (deviceId && port.deviceId !== deviceId)
+      ) {
+        invalid(
+          "Backup IP assignment references a port in another lab or device.",
+          "ipAssignment",
+          id,
+          subnetId,
+        );
+      }
+    }
+    for (const field of ["vmId", "containerId"] as const) {
+      const targetId = assignment[field] ? String(assignment[field]) : null;
+      const target = targetId ? devicesById.get(targetId) : null;
+      if (target && target.labId !== subnet.labId) {
+        invalid(
+          `Backup IP assignment ${field} belongs to another lab.`,
+          "ipAssignment",
+          id,
+          subnetId,
+        );
+      }
+    }
+  }
+}
+
+function validateBackupStorageIntegrity(input: {
+  labs: Record<string, unknown>[];
+  devices: Record<string, unknown>[];
+  storageDrives: Record<string, unknown>[];
+  driveSlots: Record<string, unknown>[];
+  storagePools: Record<string, unknown>[];
+  storagePoolDrives: Record<string, unknown>[];
+}) {
+  const labIds = new Set(input.labs.map((row) => String(row.id)));
+  const devices = new Map(
+    input.devices.map((row) => [
+      String(row.id),
+      { labId: String(row.labId ?? "") },
+    ]),
+  );
+  const drives = new Map(
+    input.storageDrives.map((row) => [
+      String(row.id),
+      { labId: String(row.labId ?? "") },
+    ]),
+  );
+  const slottedDriveIds = new Set<string>();
+
+  for (const [driveId, drive] of drives) {
+    if (!labIds.has(drive.labId)) {
+      throw new ValidationError(
+        `Backup storage drive ${driveId} references a missing lab.`,
+      );
+    }
+  }
+
+  for (const row of input.driveSlots) {
+    const slotId = String(row.id);
+    const device = devices.get(String(row.deviceId ?? ""));
+    if (!device) {
+      throw new ValidationError(
+        `Backup drive slot ${slotId} references a missing device.`,
+      );
+    }
+    if (!row.driveId) continue;
+    const driveId = String(row.driveId);
+    const drive = drives.get(driveId);
+    if (!drive || drive.labId !== device.labId) {
+      throw new ValidationError(
+        `Backup drive slot ${slotId} contains a drive from another lab or a missing drive.`,
+      );
+    }
+    if (slottedDriveIds.has(driveId)) {
+      throw new ValidationError(
+        `Backup storage drive ${driveId} is installed in more than one slot.`,
+      );
+    }
+    slottedDriveIds.add(driveId);
+  }
+
+  const pools = new Map<string, { labId: string }>();
+  for (const row of input.storagePools) {
+    const poolId = String(row.id);
+    const device = devices.get(String(row.deviceId ?? ""));
+    if (!device) {
+      throw new ValidationError(
+        `Backup storage pool ${poolId} references a missing device.`,
+      );
+    }
+    pools.set(poolId, { labId: device.labId });
+  }
+
+  const pooledDriveIds = new Set<string>();
+  for (const row of input.storagePoolDrives) {
+    const poolId = String(row.poolId ?? "");
+    const driveId = String(row.driveId ?? "");
+    const pool = pools.get(poolId);
+    const drive = drives.get(driveId);
+    if (!pool || !drive || pool.labId !== drive.labId) {
+      throw new ValidationError(
+        `Backup pool membership ${poolId}/${driveId} crosses labs or references missing storage.`,
+      );
+    }
+    if (pooledDriveIds.has(driveId)) {
+      throw new ValidationError(
+        `Backup storage drive ${driveId} belongs to more than one pool.`,
+      );
+    }
+    pooledDriveIds.add(driveId);
+  }
+}
+
+function validateBackupSnmpSchedules(input: {
+  labs: Record<string, unknown>[];
+  devices: Record<string, unknown>[];
+  schedules: Record<string, unknown>[];
+}) {
+  const labs = new Set(input.labs.map((row) => String(row.id)));
+  const devices = new Map(
+    input.devices.map((row) => [String(row.id), String(row.labId)]),
+  );
+  const scheduledDevices = new Set<string>();
+  for (const row of input.schedules) {
+    const id = String(row.id ?? "(missing id)");
+    const labId = String(row.labId ?? "");
+    const deviceId = String(row.deviceId ?? "");
+    if (!labs.has(labId) || devices.get(deviceId) !== labId) {
+      throw new ValidationError(
+        `Backup SNMP schedule ${id} crosses labs or references missing inventory.`,
+        422,
+        "BACKUP_INTEGRITY_INVALID",
+      );
+    }
+    if (!getSnmpProfile(String(row.profileId ?? ""))) {
+      throw new ValidationError(
+        `Backup SNMP schedule ${id} references an unknown profile.`,
+        422,
+        "BACKUP_INTEGRITY_INVALID",
+      );
+    }
+    if (row.policy !== "merge" && row.policy !== "mirror") {
+      throw new ValidationError(
+        `Backup SNMP schedule ${id} has an invalid policy.`,
+        422,
+        "BACKUP_INTEGRITY_INVALID",
+      );
+    }
+    if (scheduledDevices.has(deviceId)) {
+      throw new ValidationError(
+        `Backup contains duplicate SNMP schedules for device ${deviceId}.`,
+        422,
+        "BACKUP_INTEGRITY_INVALID",
+      );
+    }
+    scheduledDevices.add(deviceId);
+  }
+}
+
+function backupStringArray(value: unknown) {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean);
+  if (typeof value !== "string" || !value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function validateBackupIntegrations(input: {
+  labs: Record<string, unknown>[];
+  connections: Record<string, unknown>[];
+  schedules: Record<string, unknown>[];
+}) {
+  const labIds = new Set(input.labs.map((row) => String(row.id)));
+  const connectionIds = new Set<string>();
+  const providers = new Set([
+    "proxmox",
+    "unifi",
+    "omada",
+    "opnsense",
+    "dockhand",
+  ]);
+  for (const row of input.connections) {
+    const id = String(row.id ?? "");
+    if (!id || connectionIds.has(id)) {
+      throw new ValidationError(
+        `Backup contains a missing or duplicate integration connection ID ${id || "(missing)"}.`,
+        422,
+        "BACKUP_INTEGRITY_INVALID",
+      );
+    }
+    if (!labIds.has(String(row.labId ?? ""))) {
+      throw new ValidationError(
+        `Backup integration connection ${id} references a missing lab.`,
+        422,
+        "BACKUP_INTEGRITY_INVALID",
+      );
+    }
+    if (!providers.has(String(row.provider ?? ""))) {
+      throw new ValidationError(
+        `Backup integration connection ${id} has an unknown provider.`,
+        422,
+        "BACKUP_INTEGRITY_INVALID",
+      );
+    }
+    connectionIds.add(id);
+  }
+
+  const scheduleIds = new Set<string>();
+  for (const row of input.schedules) {
+    const id = String(row.id ?? "");
+    if (!id || scheduleIds.has(id)) {
+      throw new ValidationError(
+        `Backup contains a missing or duplicate integration schedule ID ${id || "(missing)"}.`,
+        422,
+        "BACKUP_INTEGRITY_INVALID",
+      );
+    }
+    if (!connectionIds.has(String(row.connectionId ?? ""))) {
+      throw new ValidationError(
+        `Backup integration schedule ${id} references a missing connection.`,
+        422,
+        "BACKUP_INTEGRITY_INVALID",
+      );
+    }
+    if (!["merge", "skip", "mirror", "overwrite"].includes(String(row.mode))) {
+      throw new ValidationError(
+        `Backup integration schedule ${id} has an invalid mode.`,
+        422,
+        "BACKUP_INTEGRITY_INVALID",
+      );
+    }
+    // Deleted target labs are intentionally tolerated; runtime execution
+    // reports and skips them instead of making old backups unrestorable.
+    backupStringArray(row.labIds);
+    scheduleIds.add(id);
+  }
+}
+
+const restoreBackupSnapshot = db.transaction(
+  (snapshot: Record<string, unknown>, restoredBy: string) => {
+    if (snapshot.format !== "rackpad-backup-v1") {
+      throw new ValidationError("Unsupported backup format.");
+    }
+    if (snapshot.schemaVersion !== undefined) {
+      const backupSchemaVersion = Number(snapshot.schemaVersion);
+      if (!Number.isInteger(backupSchemaVersion) || backupSchemaVersion < 1) {
+        throw new ValidationError("Backup schema version is invalid.");
+      }
+      if (backupSchemaVersion > CURRENT_SCHEMA_VERSION) {
+        throw new ValidationError(
+          `Backup schema version ${backupSchemaVersion} is newer than this Rackpad version supports (${CURRENT_SCHEMA_VERSION}).`,
+        );
+      }
+    }
+
+    const legacySecurity = Number(snapshot.schemaVersion ?? 0) < 50;
+    const data = asObject(snapshot.data);
+    const labs = normalizeArrayRecordArray(data.labs, "data.labs");
+    const rooms = normalizeArrayRecordArray(data.rooms ?? [], "data.rooms");
+    const racks = normalizeArrayRecordArray(data.racks, "data.racks");
+    const devices = normalizeArrayRecordArray(data.devices, "data.devices");
+    const virtualSwitches = normalizeArrayRecordArray(
+      data.virtualSwitches ?? [],
+      "data.virtualSwitches",
+    );
+    const ports = normalizeArrayRecordArray(data.ports, "data.ports");
+    const stackMembers = normalizeArrayRecordArray(data.deviceStackMembers ?? [], "data.deviceStackMembers");
+    const stackMacs = normalizeArrayRecordArray(data.deviceStackMemberMacs ?? [], "data.deviceStackMemberMacs");
+    const portLinks = normalizeArrayRecordArray(
+      data.portLinks,
+      "data.portLinks",
+    );
+    const portTemplates = normalizeArrayRecordArray(
+      data.portTemplates ?? [],
+      "data.portTemplates",
+    );
+    const hardwareTemplates = normalizeArrayRecordArray(
+      data.hardwareTemplates ?? [],
+      "data.hardwareTemplates",
+    );
+    const hardwareTemplateDefaults = normalizeArrayRecordArray(
+      data.hardwareTemplateDefaults ?? [],
+      "data.hardwareTemplateDefaults",
+    );
+    const devicePhysicalLayouts = normalizeArrayRecordArray(
+      data.devicePhysicalLayouts ?? [],
+      "data.devicePhysicalLayouts",
+    );
+    const driveBayTemplates = normalizeArrayRecordArray(
+      data.driveBayTemplates ?? [],
+      "data.driveBayTemplates",
+    );
+    const storageDrives = normalizeArrayRecordArray(
+      data.storageDrives ?? [],
+      "data.storageDrives",
+    );
+    const driveSlots = normalizeArrayRecordArray(
+      data.driveSlots ?? [],
+      "data.driveSlots",
+    );
+    const storagePools = normalizeArrayRecordArray(
+      data.storagePools ?? [],
+      "data.storagePools",
+    );
+    const storagePoolDrives = normalizeArrayRecordArray(
+      data.storagePoolDrives ?? [],
+      "data.storagePoolDrives",
+    );
+    const vlans = normalizeArrayRecordArray(data.vlans, "data.vlans");
+    const vlanRanges = normalizeArrayRecordArray(
+      data.vlanRanges,
+      "data.vlanRanges",
+    );
+    const subnets = normalizeArrayRecordArray(data.subnets, "data.subnets");
+    const dhcpScopes = normalizeArrayRecordArray(
+      data.dhcpScopes,
+      "data.dhcpScopes",
+    );
+    const ipZones = normalizeArrayRecordArray(data.ipZones, "data.ipZones");
+    const ipAssignments = normalizeArrayRecordArray(
+      data.ipAssignments,
+      "data.ipAssignments",
+    );
+    const discoveredDevices = normalizeArrayRecordArray(
+      data.discoveredDevices ?? [],
+      "data.discoveredDevices",
+    );
+    const discoveryScanSchedules = normalizeArrayRecordArray(
+      data.discoveryScanSchedules ?? [],
+      "data.discoveryScanSchedules",
+    );
+    const snmpSyncSchedules = normalizeArrayRecordArray(
+      data.snmpSyncSchedules ?? [],
+      "data.snmpSyncSchedules",
+    );
+    const integrationConnections = normalizeArrayRecordArray(
+      data.integrationConnections ?? [],
+      "data.integrationConnections",
+    );
+    const integrationSyncSchedules = normalizeArrayRecordArray(
+      data.integrationSyncSchedules ?? [],
+      "data.integrationSyncSchedules",
+    );
+    const documentationPages = normalizeArrayRecordArray(
+      data.documentationPages ?? [],
+      "data.documentationPages",
+    );
+    const documentationDeviceLinks = normalizeArrayRecordArray(
+      data.documentationDeviceLinks ?? [],
+      "data.documentationDeviceLinks",
+    );
+    const deviceImages = normalizeArrayRecordArray(
+      data.deviceImages ?? [],
+      "data.deviceImages",
+    );
+    const referenceImages = normalizeArrayRecordArray(
+      data.referenceImages ?? [],
+      "data.referenceImages",
+    );
+    const auditLog = normalizeArrayRecordArray(data.auditLog, "data.auditLog");
+    const users = normalizeArrayRecordArray(data.users, "data.users");
+    const userLabAccess = normalizeArrayRecordArray(
+      data.userLabAccess ?? [],
+      "data.userLabAccess",
+    );
+    const oidcIdentities = normalizeArrayRecordArray(
+      data.oidcIdentities ?? [],
+      "data.oidcIdentities",
+    );
+    const deviceMonitors = normalizeArrayRecordArray(
+      data.deviceMonitors,
+      "data.deviceMonitors",
+    );
+    const dockerImportSources = normalizeArrayRecordArray(
+      data.dockerImportSources ?? [],
+      "data.dockerImportSources",
+    );
+    const dockerContainerLinks = normalizeArrayRecordArray(
+      data.dockerContainerLinks ?? [],
+      "data.dockerContainerLinks",
+    );
+    const snmpCredentials = normalizeArrayRecordArray(
+      data.snmpCredentials ?? [],
+      "data.snmpCredentials",
+    );
+    const snmpTrapSources = normalizeArrayRecordArray(
+      data.snmpTrapSources ?? [],
+      "data.snmpTrapSources",
+    );
+    const snmpTrapLog = normalizeArrayRecordArray(
+      data.snmpTrapLog ?? [],
+      "data.snmpTrapLog",
+    );
+    const deviceServices = normalizeArrayRecordArray(
+      data.deviceServices ?? [],
+      "data.deviceServices",
+    );
+    const wifiControllers = normalizeArrayRecordArray(
+      data.wifiControllers ?? [],
+      "data.wifiControllers",
+    );
+    const wifiSsids = normalizeArrayRecordArray(
+      data.wifiSsids ?? [],
+      "data.wifiSsids",
+    );
+    const wifiAccessPoints = normalizeArrayRecordArray(
+      data.wifiAccessPoints ?? [],
+      "data.wifiAccessPoints",
+    );
+    const wifiRadios = normalizeArrayRecordArray(
+      data.wifiRadios ?? [],
+      "data.wifiRadios",
+    );
+    const wifiRadioSsids = normalizeArrayRecordArray(
+      data.wifiRadioSsids ?? [],
+      "data.wifiRadioSsids",
+    );
+    const wifiClientAssociations = normalizeArrayRecordArray(
+      data.wifiClientAssociations ?? [],
+      "data.wifiClientAssociations",
+    );
+    const appSettings = normalizeArrayRecordArray(
+      data.appSettings ?? [],
+      "data.appSettings",
+    );
+
+    if (users.length === 0) {
+      throw new ValidationError(
+        "Backup must contain at least one user account.",
+      );
+    }
+
+    validateBackupAuthorizationIntegrity({ labs, users, userLabAccess });
+    validateBackupNetworkIntegrity({
+      labs,
+      rooms,
+      racks,
+      vlans,
+      vlanRanges,
+      subnets,
+      dhcpScopes,
+      ipZones,
+      devices,
+      ports,
+      portLinks,
+      ipAssignments,
+    });
+    validateBackupStorageIntegrity({
+      labs,
+      devices,
+      storageDrives,
+      driveSlots,
+      storagePools,
+      storagePoolDrives,
+    });
+    validateBackupSnmpSchedules({
+      labs,
+      devices,
+      schedules: snmpSyncSchedules,
+    });
+    validateBackupIntegrations({
+      labs,
+      connections: integrationConnections,
+      schedules: integrationSyncSchedules,
+    });
+
+    const restoredDeviceTypeParents = new Map<string, string | null>(
+      BUILT_IN_DEVICE_TYPES.map((deviceType) => [
+        deviceType.id,
+        "parentType" in deviceType ? (deviceType.parentType ?? null) : null,
+      ]),
+    );
+    const deviceTypeSetting = appSettings.find(
+      (row) => String(row.key ?? "") === "deviceTypes",
+    );
+    if (deviceTypeSetting) {
+      const value = parseBackupJson(
+        deviceTypeSetting.value,
+        "Backup device-type settings",
+      );
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const custom = (value as { custom?: unknown }).custom;
+        if (Array.isArray(custom)) {
+          for (const entry of custom) {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+              continue;
+            }
+            const record = entry as Record<string, unknown>;
+            if (typeof record.id !== "string") continue;
+            const id = normalizeDeviceTypeId(record.id);
+            if (!id) continue;
+            const parent =
+              typeof record.parentType === "string"
+                ? normalizeDeviceTypeId(record.parentType)
+                : null;
+            restoredDeviceTypeParents.set(id, parent || null);
+          }
+        }
+      }
+    }
+    for (const device of devices) {
+      const id = normalizeDeviceTypeId(String(device.deviceType ?? ""));
+      if (id && !restoredDeviceTypeParents.has(id)) {
+        restoredDeviceTypeParents.set(id, null);
+      }
+    }
+
+    const restoredTemplates = new Map(
+      BUILT_IN_HARDWARE_TEMPLATES.map((template) => [template.id, template]),
+    );
+    const restoredTemplateNames = new Set<string>();
+    for (const row of hardwareTemplates) {
+      const rawDefinition = parseBackupJson(
+        row.definition,
+        "Backup hardware template definition",
+      );
+      const template = validateHardwareTemplateV1(rawDefinition);
+      if (template.id !== String(row.id ?? "")) {
+        throw new ValidationError(
+          "Backup hardware template ID does not match its definition.",
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      if (isReservedHardwareTemplateId(template.id)) {
+        throw new ValidationError(
+          "Backup custom hardware template uses a reserved template ID.",
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      if (restoredTemplates.has(template.id)) {
+        throw new ValidationError(
+          "Backup contains duplicate hardware template IDs.",
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      const normalizedName = template.name.trim().toLocaleLowerCase();
+      if (restoredTemplateNames.has(normalizedName)) {
+        throw new ValidationError(
+          "Backup contains duplicate hardware template names.",
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      for (const deviceType of template.deviceTypes) {
+        if (!restoredDeviceTypeParents.has(deviceType)) {
+          throw new ValidationError(
+            "Backup hardware template references an unknown device type.",
+            422,
+            "BACKUP_INTEGRITY_INVALID",
+          );
+        }
+      }
+      restoredTemplateNames.add(normalizedName);
+      restoredTemplates.set(template.id, template);
+    }
+    const restoredDefaultDeviceTypes = new Set<string>();
+    for (const row of hardwareTemplateDefaults) {
+      const deviceType = normalizeDeviceTypeId(String(row.deviceType ?? ""));
+      const templateId = String(row.templateId ?? "");
+      const template = restoredTemplates.get(templateId);
+      if (!template) {
+        throw new ValidationError(
+          "Backup hardware-template default references a missing template.",
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      if (
+        !deviceType ||
+        !restoredDeviceTypeParents.has(deviceType) ||
+        restoredDefaultDeviceTypes.has(deviceType)
+      ) {
+        throw new ValidationError(
+          "Backup hardware-template default references an invalid or duplicate device type.",
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      const supported =
+        template.deviceTypes.length === 0 ||
+        deviceTypeLineageFromParents(
+          deviceType,
+          restoredDeviceTypeParents,
+        ).some((compatibleType) =>
+          template.deviceTypes.includes(compatibleType),
+        );
+      if (!supported) {
+        throw new ValidationError(
+          "Backup hardware-template default is incompatible with its device type.",
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      restoredDefaultDeviceTypes.add(deviceType);
+    }
+    const backupDeviceIds = new Set(devices.map((row) => String(row.id ?? "")));
+    const backupPortsByDevice = new Map<string, Set<string>>();
+    for (const port of ports) {
+      const deviceId = String(port.deviceId ?? "");
+      const ids = backupPortsByDevice.get(deviceId) ?? new Set<string>();
+      ids.add(String(port.id ?? ""));
+      backupPortsByDevice.set(deviceId, ids);
+    }
+    for (const row of devicePhysicalLayouts) {
+      const deviceId = String(row.deviceId ?? "");
+      if (!backupDeviceIds.has(deviceId)) {
+        throw new ValidationError(
+          "Backup physical layout references a missing device.",
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      if (
+        !(PHYSICAL_LAYOUT_STATUSES as readonly string[]).includes(
+          String(row.status),
+        )
+      ) {
+        throw new ValidationError(
+          "Backup physical layout has an invalid status.",
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      const snapshotValue = parseBackupJson(
+        row.snapshot,
+        "Backup physical layout snapshot",
+      );
+      const bindingValue = parseBackupJson(
+        row.bindings,
+        "Backup physical layout bindings",
+      );
+      const layout = validateResolvedPhysicalLayoutV1(snapshotValue);
+      validatePortBindingsV1(bindingValue, {
+        portIds: backupPortsByDevice.get(deviceId) ?? new Set(),
+        slotIds: new Set(layout.portSlots.map((slot) => slot.id)),
+      });
+    }
+
+    db.exec(`
+    DELETE FROM userLabAccess;
+    DELETE FROM userSessions;
+    DELETE FROM oidcIdentities;
+    DELETE FROM wifiClientAssociations;
+    DELETE FROM wifiRadioSsids;
+    DELETE FROM wifiRadios;
+    DELETE FROM wifiAccessPoints;
+    DELETE FROM wifiSsids;
+    DELETE FROM wifiControllers;
+    DELETE FROM deviceServices;
+    DELETE FROM deviceMonitors;
+    DELETE FROM dockerContainerLinks;
+    DELETE FROM dockerImportSources;
+    DELETE FROM snmpTrapLog;
+    DELETE FROM snmpTrapSources;
+    DELETE FROM snmpCredentials;
+    DELETE FROM appSettings;
+    DELETE FROM auditLog;
+    DELETE FROM referenceImages;
+    DELETE FROM deviceImages;
+    DELETE FROM documentationDeviceLinks;
+    DELETE FROM documentationPages;
+    DELETE FROM ipAssignments;
+    DELETE FROM integrationSyncSchedules;
+    DELETE FROM integrationConnections;
+    DELETE FROM snmpSyncSchedules;
+    DELETE FROM discoveryScanSchedules;
+    DELETE FROM discoveredDevices;
+    DELETE FROM portLinks;
+    DELETE FROM devicePhysicalLayouts;
+    DELETE FROM ports;
+    DELETE FROM deviceStackMemberMacs;
+    DELETE FROM deviceStackMembers;
+    DELETE FROM virtualSwitches;
+    DELETE FROM storagePoolDrives;
+    DELETE FROM storagePools;
+    DELETE FROM driveSlots;
+    DELETE FROM storageDrives;
+    DELETE FROM ipZones;
+    DELETE FROM dhcpScopes;
+    DELETE FROM subnets;
+    DELETE FROM vlans;
+    DELETE FROM vlanRanges;
+    DELETE FROM portTemplates;
+    DELETE FROM hardwareTemplateDefaults;
+    DELETE FROM hardwareTemplates;
+    DELETE FROM driveBayTemplates;
+    DELETE FROM devices;
+    DELETE FROM racks;
+    DELETE FROM rooms;
+    DELETE FROM users;
+    DELETE FROM labs;
+  `);
+
+    const insertLab = db.prepare(
+      "INSERT INTO labs (id, name, description, location) VALUES (?, ?, ?, ?)",
+    );
+    const insertRoom = db.prepare(
+      "INSERT INTO rooms (id, labId, name, description, location, notes) VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    const insertRack = db.prepare(
+      "INSERT INTO racks (id, labId, name, totalU, description, location, notes, roomId, studioX, studioY) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    const insertDevice = db.prepare(`
+    INSERT INTO devices
+      (id, labId, rackId, hostname, displayName, deviceType, manufacturer, model, serial, managementIp, macAddress, ignoreDuplicateMac, status, placement, parentDeviceId, roomId, cpuCores, memoryGb, storageGb, specs, startU, heightU, face, rackSlot, tags, notes, lastSeen, networkMode, snmpCredentialId, rackMountKind, rackColumn, rackColumnSpan, shelfX, shelfY, shelfWidth, shelfHeight, shelfOrientation, rackSide)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const updateDeviceParent = db.prepare(`
+    UPDATE devices
+    SET parentDeviceId = ?
+    WHERE id = ?
+  `);
+    const insertVirtualSwitch = db.prepare(`
+    INSERT INTO virtualSwitches (id, hostDeviceId, name, kind, notes, membersShareHostIp)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+    const insertPort = db.prepare(`
+    INSERT INTO ports (id, deviceId, name, position, kind, speed, linkState, mode, vlanId, allowedVlanIds, description, face, virtualSwitchId, snmpIfIndex, macAddress, portRole, aggregatePortId)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const updatePortAggregate = db.prepare(`
+    UPDATE ports
+    SET aggregatePortId = ?
+    WHERE id = ?
+  `);
+    const insertPortLink = db.prepare(
+      `INSERT INTO portLinks
+        (id, fromPortId, toPortId, cableType, cableLength, color, notes, label, visible, routeWaypoints)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const insertPortTemplate = db.prepare(`
+    INSERT INTO portTemplates (id, name, description, deviceTypes, ports, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertHardwareTemplate = db.prepare(`
+    INSERT INTO hardwareTemplates
+      (id, name, description, category, deviceTypes, definition, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertHardwareTemplateDefault = db.prepare(`
+    INSERT INTO hardwareTemplateDefaults (deviceType, templateId, updatedAt)
+    VALUES (?, ?, ?)
+  `);
+    const insertDevicePhysicalLayout = db.prepare(`
+    INSERT INTO devicePhysicalLayouts
+      (deviceId, sourceTemplateId, status, snapshot, bindings, portFingerprint, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertDriveBayTemplate = db.prepare(`
+    INSERT INTO driveBayTemplates (id, name, description, deviceTypes, sections, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertStorageDrive = db.prepare(`
+    INSERT INTO storageDrives
+      (id, labId, manufacturer, model, serial, capacityGb, interface, formFactor, notes, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertDriveSlot = db.prepare(`
+    INSERT INTO driveSlots
+      (id, deviceId, name, sectionName, sectionOrder, position, slotType, face, layout, columns, driveId, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertStoragePool = db.prepare(`
+    INSERT INTO storagePools
+      (id, deviceId, name, poolType, usableCapacityGb, status, notes, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertStoragePoolDrive = db.prepare(`
+    INSERT INTO storagePoolDrives (poolId, driveId, createdAt)
+    VALUES (?, ?, ?)
+  `);
+    const insertVlan = db.prepare(
+      "INSERT INTO vlans (id, labId, vlanId, name, description, color) VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    const insertVlanRange = db.prepare(
+      "INSERT INTO vlanRanges (id, labId, name, startVlan, endVlan, purpose, color) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    );
+    const insertSubnet = db.prepare(
+      "INSERT INTO subnets (id, labId, cidr, name, description, gateway, dnsServers, vlanId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    const insertDhcpScope = db.prepare(
+      "INSERT INTO dhcpScopes (id, subnetId, name, startIp, endIp, gateway, dnsServers, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    const insertIpZone = db.prepare(
+      "INSERT INTO ipZones (id, subnetId, kind, startIp, endIp, description) VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    const insertIpAssignment = db.prepare(`
+    INSERT INTO ipAssignments (id, subnetId, ipAddress, assignmentType, deviceId, portId, vmId, containerId, hostname, description, allocationMode, dhcpScopeId)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertDiscoveredDevice = db.prepare(`
+    INSERT INTO discoveredDevices
+      (id, labId, ipAddress, hostname, displayName, deviceType, placement, macAddress, vendor, source, status, notes, importedDeviceId, lastSeen, lastScannedAt, technicalRole, technicalReason)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertDiscoveryScanSchedule = db.prepare(`
+    INSERT INTO discoveryScanSchedules
+      (id, labId, name, cidr, intervalMs, enabled, lastRunAt, lastResult, lastMessage, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertSnmpSyncSchedule = db.prepare(`
+    INSERT INTO snmpSyncSchedules
+      (id, labId, deviceId, profileId, policy, intervalMs, enabled, lastRunAt, lastResult, lastMessage, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertIntegrationConnection = db.prepare(`
+    INSERT INTO integrationConnections (
+      id, labId, provider, name, baseUrl, authKind, authId, authSecretEnc,
+      siteRef, verifyTls, enabled, syncVlans, syncSubnets, syncDhcp,
+      lastStatus, lastCheckedAt, lastError, lastSummary, createdAt, updatedAt,
+      autoSyncEnabled, autoSyncMode, autoSyncCron, autoSyncLabIds,
+      autoSyncFailureCount, autoSyncPausedUntil, lastAutoSyncAt,
+      lastAutoSyncStatus, lastAutoSyncMessage, scopeRefs, syncDevices, syncWifi,
+      syncSwitches, syncGateways, syncAccessPoints, syncHosts, syncGuests
+    ) VALUES (
+      @id, @labId, @provider, @name, @baseUrl, @authKind, @authId,
+      @authSecretEnc, @siteRef, @verifyTls, @enabled, @syncVlans,
+      @syncSubnets, @syncDhcp, @lastStatus, @lastCheckedAt, @lastError,
+      @lastSummary, @createdAt, @updatedAt, @autoSyncEnabled, @autoSyncMode,
+      @autoSyncCron, @autoSyncLabIds, @autoSyncFailureCount,
+      @autoSyncPausedUntil, @lastAutoSyncAt, @lastAutoSyncStatus,
+      @lastAutoSyncMessage, @scopeRefs, @syncDevices, @syncWifi,
+      @syncSwitches, @syncGateways, @syncAccessPoints, @syncHosts, @syncGuests
+    )
+  `);
+    const insertIntegrationSyncSchedule = db.prepare(`
+    INSERT INTO integrationSyncSchedules (
+      id, connectionId, name, enabled, mode, cron, labIds, failureCount,
+      pausedUntil, lastRunAt, lastRunStatus, lastRunMessage, createdAt, updatedAt
+    ) VALUES (
+      @id, @connectionId, @name, @enabled, @mode, @cron, @labIds,
+      @failureCount, @pausedUntil, @lastRunAt, @lastRunStatus,
+      @lastRunMessage, @createdAt, @updatedAt
+    )
+  `);
+    const insertDocumentationPage = db.prepare(`
+    INSERT INTO documentationPages (id, labId, title, content, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+    const insertDocumentationDeviceLink = db.prepare(`
+    INSERT INTO documentationDeviceLinks (id, documentationPageId, deviceId, createdAt)
+    VALUES (?, ?, ?, ?)
+  `);
+    const insertDeviceImage = db.prepare(`
+    INSERT INTO deviceImages (id, deviceId, label, fileName, mimeType, dataUrl, notes, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertReferenceImage = db.prepare(`
+    INSERT INTO referenceImages (id, labId, entityType, entityId, label, fileName, mimeType, dataUrl, face, notes, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertAudit = db.prepare(
+      "INSERT INTO auditLog (id, ts, user, action, entityType, entityId, summary) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    );
+    const insertUser = db.prepare(`
+    INSERT INTO users (id, username, displayName, passwordHash, role, disabled, createdAt, lastLoginAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertUserLabAccess = db.prepare(`
+    INSERT INTO userLabAccess (userId, labId, role)
+    VALUES (?, ?, ?)
+  `);
+    const insertOidcIdentity = db.prepare(`
+    INSERT INTO oidcIdentities (issuer, subject, userId, email, displayName, createdAt, updatedAt, roleRecheckRequired)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertDeviceMonitor = db.prepare(`
+    INSERT INTO deviceMonitors (
+      id,
+      deviceId,
+      name,
+      type,
+      target,
+      port,
+      path,
+      ignoreTlsErrors,
+      snmpVersion,
+      snmpCommunityEnc,
+      snmpOid,
+      snmpExpectedValue,
+      snmpMatchMode,
+      portId,
+      snmpIfIndex,
+      snmpCredentialId,
+      intervalMs,
+      enabled,
+      sortOrder,
+      lastCheckAt,
+      lastAlertAt,
+      lastResult,
+      lastMessage
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertSnmpCredential = db.prepare(`
+    INSERT INTO snmpCredentials (
+      id, labId, name, version,
+      communityEnc, v3User, v3AuthProto, v3AuthPassEnc, v3PrivProto, v3PrivPassEnc, v3Context,
+      createdAt, updatedAt
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertDockerImportSource = db.prepare(`
+    INSERT INTO dockerImportSources (
+      id, labId, name, endpoint, tokenEnc,
+      lastSyncAt, lastSyncStatus, lastSyncMessage, createdAt, updatedAt,
+      enabled, verifyTls
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertDockerContainerLink = db.prepare(`
+    INSERT INTO dockerContainerLinks (
+      deviceId, sourceId, containerId, containerName, image,
+      state, status, lastSyncedAt, createdAt, updatedAt
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertSnmpTrapSource = db.prepare(`
+    INSERT INTO snmpTrapSources (id, labId, deviceId, sourceIp, community, credentialId, lastTrapAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertSnmpTrapLog = db.prepare(`
+    INSERT INTO snmpTrapLog (id, labId, deviceId, sourceIp, trapOid, ifIndex, varbindsJson, resultAction, message, receivedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertDeviceService = db.prepare(`
+    INSERT INTO deviceServices (id, deviceId, name, serviceType, ipAssignmentId, portId, vlanId, monitorId, url, notes, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertWifiController = db.prepare(`
+    INSERT INTO wifiControllers (id, labId, deviceId, name, vendor, model, managementIp, notes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertWifiSsid = db.prepare(`
+    INSERT INTO wifiSsids (id, labId, name, purpose, security, hidden, vlanId, color)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertWifiAccessPoint = db.prepare(`
+    INSERT INTO wifiAccessPoints (deviceId, controllerId, location, firmwareVersion, notes)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+    const insertWifiRadio = db.prepare(`
+    INSERT INTO wifiRadios (id, apDeviceId, slotName, band, channel, channelWidth, txPower, notes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertWifiRadioSsid = db.prepare(`
+    INSERT INTO wifiRadioSsids (radioId, ssidId)
+    VALUES (?, ?)
+  `);
+    const insertWifiClientAssociation = db.prepare(`
+    INSERT INTO wifiClientAssociations
+      (clientDeviceId, apDeviceId, radioId, ssidId, band, channel, signalDbm, lastSeen, lastRoamAt, notes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+    const insertAppSetting = db.prepare(`
+    INSERT INTO appSettings (key, value, updatedAt)
+    VALUES (?, ?, ?)
+  `);
+
+    for (const row of labs) {
+      insertLab.run(
+        row.id,
+        row.name,
+        row.description ?? null,
+        row.location ?? null,
+      );
+    }
+    for (const row of integrationConnections) {
+      insertIntegrationConnection.run({
+        id: row.id,
+        labId: row.labId,
+        provider: row.provider,
+        name: row.name,
+        baseUrl: row.baseUrl,
+        authKind: row.authKind,
+        authId: row.authId ?? null,
+        authSecretEnc: row.authSecretEnc ?? null,
+        siteRef: row.siteRef ?? null,
+        verifyTls: row.verifyTls == null ? 1 : Number(Boolean(row.verifyTls)),
+        enabled: row.enabled == null ? 1 : Number(Boolean(row.enabled)),
+        syncVlans: row.syncVlans == null ? 1 : Number(Boolean(row.syncVlans)),
+        syncSubnets:
+          row.syncSubnets == null ? 1 : Number(Boolean(row.syncSubnets)),
+        syncDhcp: row.syncDhcp == null ? 1 : Number(Boolean(row.syncDhcp)),
+        lastStatus: row.lastStatus ?? "unknown",
+        lastCheckedAt: row.lastCheckedAt ?? null,
+        lastError: row.lastError ?? null,
+        lastSummary:
+          typeof row.lastSummary === "string"
+            ? row.lastSummary
+            : row.lastSummary
+              ? JSON.stringify(row.lastSummary)
+              : null,
+        createdAt: row.createdAt ?? new Date().toISOString(),
+        updatedAt: row.updatedAt ?? row.createdAt ?? new Date().toISOString(),
+        autoSyncEnabled: Number(Boolean(row.autoSyncEnabled ?? 0)),
+        autoSyncMode:
+          row.autoSyncMode === "skip" ||
+          row.autoSyncMode === "mirror" ||
+          row.autoSyncMode === "overwrite"
+            ? "skip"
+            : "merge",
+        autoSyncCron: row.autoSyncCron ?? null,
+        autoSyncLabIds:
+          typeof row.autoSyncLabIds === "string"
+            ? row.autoSyncLabIds
+            : Array.isArray(row.autoSyncLabIds)
+              ? JSON.stringify(row.autoSyncLabIds)
+              : null,
+        autoSyncFailureCount: Number(row.autoSyncFailureCount ?? 0),
+        autoSyncPausedUntil: row.autoSyncPausedUntil ?? null,
+        lastAutoSyncAt: row.lastAutoSyncAt ?? null,
+        lastAutoSyncStatus: row.lastAutoSyncStatus ?? null,
+        lastAutoSyncMessage: row.lastAutoSyncMessage ?? null,
+        scopeRefs:
+          typeof row.scopeRefs === "string"
+            ? row.scopeRefs
+            : Array.isArray(row.scopeRefs)
+              ? JSON.stringify(row.scopeRefs)
+              : null,
+        syncDevices:
+          row.syncDevices == null ? 1 : Number(Boolean(row.syncDevices)),
+        syncWifi: row.syncWifi == null ? 1 : Number(Boolean(row.syncWifi)),
+        syncSwitches:
+          row.syncSwitches == null ? 1 : Number(Boolean(row.syncSwitches)),
+        syncGateways:
+          row.syncGateways == null ? 1 : Number(Boolean(row.syncGateways)),
+        syncAccessPoints:
+          row.syncAccessPoints == null
+            ? 1
+            : Number(Boolean(row.syncAccessPoints)),
+        syncHosts: row.syncHosts == null ? 1 : Number(Boolean(row.syncHosts)),
+        syncGuests:
+          row.syncGuests == null ? 1 : Number(Boolean(row.syncGuests)),
+      });
+    }
+    for (const row of integrationSyncSchedules) {
+      insertIntegrationSyncSchedule.run({
+        id: row.id,
+        connectionId: row.connectionId,
+        name: row.name,
+        enabled: row.enabled == null ? 1 : Number(Boolean(row.enabled)),
+        mode:
+          row.mode === "skip" ||
+          row.mode === "mirror" ||
+          row.mode === "overwrite"
+            ? "skip"
+            : "merge",
+        cron: row.cron,
+        labIds:
+          typeof row.labIds === "string"
+            ? row.labIds
+            : Array.isArray(row.labIds)
+              ? JSON.stringify(row.labIds)
+              : null,
+        failureCount: Number(row.failureCount ?? 0),
+        pausedUntil: row.pausedUntil ?? null,
+        lastRunAt: row.lastRunAt ?? null,
+        lastRunStatus: row.lastRunStatus ?? null,
+        lastRunMessage: row.lastRunMessage ?? null,
+        createdAt: row.createdAt ?? new Date().toISOString(),
+        updatedAt: row.updatedAt ?? row.createdAt ?? new Date().toISOString(),
+      });
+    }
+    for (const row of users) {
+      insertUser.run(
+        row.id,
+        row.username,
+        row.displayName,
+        row.passwordHash,
+        row.role,
+        Number(row.disabled ?? 0),
+        row.createdAt,
+        row.lastLoginAt ?? null,
+      );
+    }
+    for (const row of userLabAccess) {
+      insertUserLabAccess.run(row.userId, row.labId, row.role);
+    }
+    for (const row of oidcIdentities) {
+      const roleRecheckRequired = legacySecurity ? 1 : row.roleRecheckRequired ?? 1;
+      if (roleRecheckRequired !== 0 && roleRecheckRequired !== 1) {
+        throw new ValidationError("Invalid OIDC role recheck marker in backup.");
+      }
+      insertOidcIdentity.run(
+        row.issuer,
+        row.subject,
+        row.userId,
+        row.email ?? null,
+        row.displayName ?? null,
+        row.createdAt,
+        row.updatedAt,
+        roleRecheckRequired,
+      );
+    }
+    for (const row of rooms) {
+      insertRoom.run(
+        row.id,
+        row.labId,
+        row.name,
+        row.description ?? null,
+        row.location ?? null,
+        row.notes ?? null,
+      );
+    }
+    for (const row of racks) {
+      insertRack.run(
+        row.id,
+        row.labId,
+        row.name,
+        row.totalU,
+        row.description ?? null,
+        row.location ?? null,
+        row.notes ?? null,
+        row.roomId ?? null,
+        row.studioX ?? null,
+        row.studioY ?? null,
+      );
+    }
+    const restoredRackRows = db
+      .prepare(
+        `
+          SELECT racks.id, racks.labId, racks.roomId, racks.studioX, racks.studioY,
+                 rooms.labId AS roomLabId
+          FROM racks
+          LEFT JOIN rooms ON rooms.id = racks.roomId
+          ORDER BY racks.id
+        `,
+      )
+      .all() as Array<{
+      id: string;
+      labId: string;
+      roomId: string | null;
+      studioX: number | null;
+      studioY: number | null;
+      roomLabId: string | null;
+    }>;
+    for (const rack of restoredRackRows) {
+      if (rack.roomId && rack.roomLabId !== rack.labId) {
+        throw new ValidationError(
+          `Backup rack ${rack.id} references a room in another lab.`,
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      if ((rack.studioX === null) !== (rack.studioY === null)) {
+        throw new ValidationError(
+          `Backup rack ${rack.id} has an incomplete Rack Studio position.`,
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      if (rack.studioX !== null && !rack.roomId) {
+        throw new ValidationError(
+          `Backup rack ${rack.id} must belong to a room before it can be positioned.`,
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      try {
+        if (rack.roomId) {
+          assertRackStudioRackFootprint({
+            roomId: rack.roomId,
+            x: rack.studioX,
+            y: rack.studioY,
+          });
+        }
+      } catch (error) {
+        throw new ValidationError(
+          `Backup rack ${rack.id} has an invalid Rack Studio footprint: ${error instanceof Error ? error.message : "invalid coordinates"}`,
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+    }
+    for (const row of snmpCredentials) {
+      insertSnmpCredential.run(
+        row.id,
+        row.labId,
+        row.name,
+        row.version,
+        row.communityEnc ?? null,
+        row.v3User ?? null,
+        row.v3AuthProto ?? null,
+        row.v3AuthPassEnc ?? null,
+        row.v3PrivProto ?? null,
+        row.v3PrivPassEnc ?? null,
+        row.v3Context ?? null,
+        row.createdAt ?? new Date().toISOString(),
+        row.updatedAt ?? row.createdAt ?? new Date().toISOString(),
+      );
+    }
+    for (const row of dockerImportSources) {
+      insertDockerImportSource.run(
+        row.id,
+        row.labId,
+        row.name,
+        row.endpoint,
+        row.tokenEnc ?? null,
+        row.lastSyncAt ?? null,
+        row.lastSyncStatus ?? null,
+        row.lastSyncMessage ?? null,
+        row.createdAt ?? new Date().toISOString(),
+        row.updatedAt ?? row.createdAt ?? new Date().toISOString(),
+        row.enabled == null ? 1 : Number(Boolean(row.enabled)),
+        row.verifyTls == null ? 1 : Number(Boolean(row.verifyTls)),
+      );
+    }
+    const restoredShelfIndexes = new Map<string, number>();
+    const restoredShelfCounts = new Map<string, number>();
+    for (const row of devices) {
+      if (row.placement !== "shelf" || !row.parentDeviceId) continue;
+      const parentDeviceId = String(row.parentDeviceId);
+      restoredShelfCounts.set(
+        parentDeviceId,
+        (restoredShelfCounts.get(parentDeviceId) ?? 0) + 1,
+      );
+    }
+    for (const row of devices) {
+      const restoredShelfParentId = row.parentDeviceId
+        ? String(row.parentDeviceId)
+        : null;
+      const restoredShelfIndex =
+        row.placement === "shelf" && restoredShelfParentId
+          ? (restoredShelfIndexes.get(restoredShelfParentId) ?? 0)
+          : null;
+      if (restoredShelfIndex !== null) {
+        restoredShelfIndexes.set(
+          restoredShelfParentId!,
+          restoredShelfIndex + 1,
+        );
+      }
+      const restoredShelfGeometry =
+        restoredShelfIndex === null || restoredShelfParentId === null
+          ? null
+          : legacyShelfGeometry(
+              restoredShelfIndex,
+              restoredShelfCounts.get(restoredShelfParentId) ?? 1,
+            );
+      insertDevice.run(
+        row.id,
+        row.labId,
+        row.rackId ?? null,
+        row.hostname,
+        row.displayName ?? null,
+        row.deviceType,
+        row.manufacturer ?? null,
+        row.model ?? null,
+        row.serial ?? null,
+        row.managementIp ?? null,
+        row.macAddress ?? null,
+        row.ignoreDuplicateMac == null
+          ? 0
+          : Number(Boolean(row.ignoreDuplicateMac)),
+        row.status,
+        row.placement ?? null,
+        null,
+        row.roomId ?? null,
+        row.cpuCores ?? null,
+        row.memoryGb ?? null,
+        row.storageGb ?? null,
+        row.specs ?? null,
+        row.startU ?? null,
+        row.heightU ?? null,
+        row.face ?? null,
+        row.rackSlot ?? "full",
+        row.tags ? JSON.stringify(row.tags) : null,
+        row.notes ?? null,
+        row.lastSeen ?? null,
+        row.networkMode ?? "normal",
+        row.snmpCredentialId ?? null,
+        row.rackMountKind ?? (row.placement === "shelf" ? "shelf" : "direct"),
+        row.rackColumn ?? (row.rackSlot === "right" ? 6 : 0),
+        row.rackColumnSpan ??
+          (row.rackSlot === "full" || row.rackSlot == null ? 12 : 6),
+        row.shelfX ??
+          (restoredShelfIndex === null
+            ? null
+            : restoredShelfGeometry!.x),
+        row.shelfY ??
+          (restoredShelfIndex === null
+            ? null
+            : restoredShelfGeometry!.y),
+        row.shelfWidth ??
+          (restoredShelfIndex === null ? null : restoredShelfGeometry!.width),
+        row.shelfHeight ??
+          (restoredShelfIndex === null ? null : restoredShelfGeometry!.height),
+        row.shelfOrientation ?? 0,
+        row.rackSide ?? null,
+      );
+    }
+    for (const row of stackMembers) {
+      db.prepare(`INSERT INTO deviceStackMembers (id, deviceId, position, name, manufacturer, model, serial, heightU, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(row.id, row.deviceId, row.position, row.name, row.manufacturer ?? null, row.model ?? null, row.serial ?? null, row.heightU, row.status, row.notes ?? null);
+    }
+    for (const row of stackMacs) db.prepare('INSERT INTO deviceStackMemberMacs (memberId, label, macAddress) VALUES (?, ?, ?)').run(row.memberId, row.label, row.macAddress);
+    const deviceIds = new Set(devices.map((row) => String(row.id)));
+    for (const row of devices) {
+      const parentDeviceId = row.parentDeviceId
+        ? String(row.parentDeviceId)
+        : null;
+      if (
+        !parentDeviceId ||
+        parentDeviceId === String(row.id) ||
+        !deviceIds.has(parentDeviceId)
+      ) {
+        continue;
+      }
+      updateDeviceParent.run(parentDeviceId, row.id);
+    }
+    for (const row of storageDrives) {
+      insertStorageDrive.run(
+        row.id,
+        row.labId,
+        row.manufacturer ?? null,
+        row.model ?? null,
+        row.serial ?? null,
+        row.capacityGb,
+        row.interface,
+        row.formFactor,
+        row.notes ?? null,
+        row.createdAt ?? new Date().toISOString(),
+        row.updatedAt ?? row.createdAt ?? new Date().toISOString(),
+      );
+    }
+    for (const row of driveSlots) {
+      insertDriveSlot.run(
+        row.id,
+        row.deviceId,
+        row.name,
+        row.sectionName,
+        row.sectionOrder ?? 0,
+        row.position,
+        row.slotType,
+        row.face,
+        row.layout,
+        row.columns ?? null,
+        row.driveId ?? null,
+        row.createdAt ?? new Date().toISOString(),
+        row.updatedAt ?? row.createdAt ?? new Date().toISOString(),
+      );
+    }
+    for (const row of storagePools) {
+      insertStoragePool.run(
+        row.id,
+        row.deviceId,
+        row.name,
+        row.poolType,
+        row.usableCapacityGb,
+        row.status,
+        row.notes ?? null,
+        row.createdAt ?? new Date().toISOString(),
+        row.updatedAt ?? row.createdAt ?? new Date().toISOString(),
+      );
+    }
+    for (const row of storagePoolDrives) {
+      insertStoragePoolDrive.run(
+        row.poolId,
+        row.driveId,
+        row.createdAt ?? new Date().toISOString(),
+      );
+    }
+    for (const row of dockerContainerLinks) {
+      insertDockerContainerLink.run(
+        row.deviceId,
+        row.sourceId,
+        row.containerId,
+        row.containerName,
+        row.image,
+        row.state,
+        row.status,
+        row.lastSyncedAt ?? null,
+        row.createdAt ?? new Date().toISOString(),
+        row.updatedAt ?? row.createdAt ?? new Date().toISOString(),
+      );
+    }
+    for (const row of snmpTrapSources) {
+      insertSnmpTrapSource.run(
+        row.id,
+        row.labId,
+        row.deviceId ?? null,
+        row.sourceIp,
+        null,
+        legacySecurity ? null : row.credentialId ?? null,
+        row.lastTrapAt ?? null,
+      );
+    }
+    for (const row of snmpTrapLog) {
+      insertSnmpTrapLog.run(
+        row.id,
+        row.labId,
+        row.deviceId ?? null,
+        row.sourceIp,
+        row.trapOid ?? null,
+        row.ifIndex ?? null,
+        row.varbindsJson ?? null,
+        row.resultAction ?? "logged",
+        row.message ?? "",
+        row.receivedAt ?? new Date().toISOString(),
+      );
+    }
+    for (const row of virtualSwitches) {
+      insertVirtualSwitch.run(
+        row.id,
+        row.hostDeviceId,
+        row.name,
+        row.kind ?? "external",
+        row.notes ?? null,
+        Number(row.membersShareHostIp ?? 0),
+      );
+    }
+    for (const row of vlans) {
+      insertVlan.run(
+        row.id,
+        row.labId,
+        row.vlanId,
+        row.name,
+        row.description ?? null,
+        row.color ?? null,
+      );
+    }
+    for (const row of vlanRanges) {
+      insertVlanRange.run(
+        row.id,
+        row.labId,
+        row.name,
+        row.startVlan,
+        row.endVlan,
+        row.purpose ?? null,
+        row.color ?? null,
+      );
+    }
+    for (const row of subnets) {
+      insertSubnet.run(
+        row.id,
+        row.labId,
+        row.cidr,
+        row.name,
+        row.description ?? null,
+        row.gateway ?? null,
+        row.dnsServers ? JSON.stringify(row.dnsServers) : null,
+        row.vlanId ?? null,
+      );
+    }
+    for (const row of ports) {
+      insertPort.run(
+        row.id,
+        row.deviceId,
+        row.name,
+        row.position,
+        row.kind,
+        row.speed ?? null,
+        row.linkState,
+        row.mode ?? "access",
+        row.vlanId ?? null,
+        row.allowedVlanIds ? JSON.stringify(row.allowedVlanIds) : null,
+        row.description ?? null,
+        row.face ?? null,
+        row.virtualSwitchId ?? null,
+        row.snmpIfIndex ?? null,
+        row.macAddress ?? null,
+        row.portRole ?? "physical",
+        null,
+      );
+    }
+    ensurePatchPanelPassThroughPorts(
+      devices
+        .filter((row) =>
+          deviceTypeLineageFromParents(
+            String(row.deviceType ?? ""),
+            restoredDeviceTypeParents,
+          ).includes("patch_panel"),
+        )
+        .map((row) => String(row.id)),
+    );
+    const portIds = new Set(ports.map((row) => String(row.id)));
+    for (const row of ports) {
+      const aggregatePortId = row.aggregatePortId
+        ? String(row.aggregatePortId)
+        : null;
+      if (aggregatePortId && portIds.has(aggregatePortId)) {
+        updatePortAggregate.run(aggregatePortId, row.id);
+      }
+    }
+    for (const row of portLinks) {
+      const routeWaypoints = parseCableRouteWaypoints(
+        parseBackupJson(
+          row.routeWaypoints ?? [],
+          "Backup cable route waypoints",
+        ),
+      );
+      if (
+        row.visible !== undefined &&
+        row.visible !== null &&
+        row.visible !== true &&
+        row.visible !== false &&
+        row.visible !== 0 &&
+        row.visible !== 1
+      ) {
+        throw new ValidationError(
+          "Backup cable visibility is invalid.",
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+      insertPortLink.run(
+        row.id,
+        row.fromPortId,
+        row.toPortId,
+        row.cableType ?? null,
+        row.cableLength ?? null,
+        row.color ?? null,
+        row.notes ?? null,
+        row.label ?? null,
+        row.visible === false || row.visible === 0 ? 0 : 1,
+        JSON.stringify(routeWaypoints),
+      );
+    }
+    for (const row of portTemplates) {
+      insertPortTemplate.run(
+        row.id,
+        row.name,
+        row.description,
+        JSON.stringify(row.deviceTypes ?? []),
+        JSON.stringify(row.ports ?? []),
+        row.createdAt ?? new Date().toISOString(),
+        row.updatedAt ?? new Date().toISOString(),
+      );
+    }
+    for (const row of hardwareTemplates) {
+      const rawDefinition = parseBackupJson(
+        row.definition,
+        "Backup hardware template definition",
+      );
+      const template = validateHardwareTemplateV1(rawDefinition);
+      insertHardwareTemplate.run(
+        template.id,
+        template.name,
+        template.description,
+        template.category,
+        JSON.stringify(template.deviceTypes),
+        JSON.stringify(template),
+        row.createdAt ?? new Date().toISOString(),
+        row.updatedAt ?? row.createdAt ?? new Date().toISOString(),
+      );
+    }
+    for (const row of hardwareTemplateDefaults) {
+      insertHardwareTemplateDefault.run(
+        row.deviceType,
+        row.templateId,
+        row.updatedAt ?? new Date().toISOString(),
+      );
+    }
+    const restoredPortsByDevice = new Map<string, PhysicalLayoutPort[]>();
+    const normalizedRestoredPorts = db
+      .prepare(
+        `
+          SELECT id, deviceId, name, position, kind, face, portRole
+          FROM ports
+          ORDER BY deviceId, position, id
+        `,
+      )
+      .all() as Array<PhysicalLayoutPort & { deviceId: string }>;
+    for (const row of normalizedRestoredPorts) {
+      const deviceId = row.deviceId;
+      const list = restoredPortsByDevice.get(deviceId) ?? [];
+      const port = {
+        id: row.id,
+        name: row.name,
+        position: row.position,
+        kind: row.kind,
+        face: row.face,
+        portRole: row.portRole ?? "physical",
+      } satisfies PhysicalLayoutPort;
+      if (isPhysicalLayoutPort(port)) list.push(port);
+      restoredPortsByDevice.set(deviceId, list);
+    }
+    const restoredLayoutDeviceIds = new Set<string>();
+    for (const row of devicePhysicalLayouts) {
+      const deviceId = String(row.deviceId);
+      const snapshot = validateResolvedPhysicalLayoutV1(
+        parseBackupJson(row.snapshot, "Backup physical layout snapshot"),
+      );
+      const bindings = validatePortBindingsV1(
+        parseBackupJson(row.bindings, "Backup physical layout bindings"),
+        {
+          portIds: new Set(
+            (restoredPortsByDevice.get(deviceId) ?? []).map((port) => port.id),
+          ),
+          slotIds: new Set(snapshot.portSlots.map((slot) => slot.id)),
+        },
+      );
+      const layoutPorts = restoredPortsByDevice.get(deviceId) ?? [];
+      const sourceTemplateId = String(
+        row.sourceTemplateId ?? snapshot.sourceTemplateId,
+      );
+      const reconciled = reconcilePhysicalLayoutBindings({
+        snapshot,
+        bindings,
+        status: row.status as PhysicalLayoutStatus,
+        sourceTemplateId,
+        ports: layoutPorts,
+      });
+      insertDevicePhysicalLayout.run(
+        deviceId,
+        sourceTemplateId,
+        reconciled.status,
+        JSON.stringify(snapshot),
+        JSON.stringify(reconciled.bindings),
+        reconciled.portFingerprint,
+        row.createdAt ?? new Date().toISOString(),
+        row.updatedAt ?? row.createdAt ?? new Date().toISOString(),
+      );
+      restoredLayoutDeviceIds.add(deviceId);
+    }
+    for (const row of devices) {
+      const deviceId = String(row.id);
+      if (restoredLayoutDeviceIds.has(deviceId)) continue;
+      const layoutPorts = restoredPortsByDevice.get(deviceId) ?? [];
+      const generated = buildAutoPhysicalLayout(
+        {
+          id: deviceId,
+          deviceType: String(row.deviceType),
+          heightU: row.heightU == null ? null : Number(row.heightU),
+          rackSlot: row.rackSlot == null ? "full" : String(row.rackSlot),
+          placement: row.placement == null ? null : String(row.placement),
+        } satisfies PhysicalLayoutDevice,
+        layoutPorts,
+        "legacy",
+      );
+      const now = new Date().toISOString();
+      insertDevicePhysicalLayout.run(
+        deviceId,
+        generated.snapshot.sourceTemplateId,
+        generated.status,
+        JSON.stringify(generated.snapshot),
+        JSON.stringify(generated.bindings),
+        portSetFingerprint(layoutPorts),
+        now,
+        now,
+      );
+    }
+    for (const row of driveBayTemplates) {
+      insertDriveBayTemplate.run(
+        row.id,
+        row.name,
+        row.description,
+        JSON.stringify(row.deviceTypes ?? []),
+        JSON.stringify(row.sections ?? []),
+        row.createdAt ?? new Date().toISOString(),
+        row.updatedAt ?? row.createdAt ?? new Date().toISOString(),
+      );
+    }
+    for (const row of dhcpScopes) {
+      insertDhcpScope.run(
+        row.id,
+        row.subnetId,
+        row.name,
+        row.startIp,
+        row.endIp,
+        row.gateway ?? null,
+        row.dnsServers ? JSON.stringify(row.dnsServers) : null,
+        row.description ?? null,
+      );
+    }
+    for (const row of ipZones) {
+      insertIpZone.run(
+        row.id,
+        row.subnetId,
+        row.kind,
+        row.startIp,
+        row.endIp,
+        row.description ?? null,
+      );
+    }
+    for (const row of ipAssignments) {
+      insertIpAssignment.run(
+        row.id,
+        row.subnetId,
+        row.ipAddress,
+        row.assignmentType,
+        row.deviceId ?? null,
+        row.portId ?? null,
+        row.vmId ?? null,
+        row.containerId ?? null,
+        row.hostname ?? null,
+        row.description ?? null,
+        row.allocationMode ?? "static",
+        row.dhcpScopeId ?? null,
+      );
+    }
+    for (const row of discoveredDevices) {
+      insertDiscoveredDevice.run(
+        row.id,
+        row.labId,
+        row.ipAddress,
+        row.hostname ?? null,
+        row.displayName ?? null,
+        row.deviceType ?? null,
+        row.placement ?? null,
+        row.macAddress ?? null,
+        row.vendor ?? null,
+        row.source,
+        row.status ?? "new",
+        row.notes ?? null,
+        row.importedDeviceId ?? null,
+        row.lastSeen ?? null,
+        row.lastScannedAt ?? new Date().toISOString(),
+        row.technicalRole ?? null,
+        row.technicalReason ?? null,
+      );
+    }
+    for (const row of discoveryScanSchedules) {
+      const now = new Date().toISOString();
+      insertDiscoveryScanSchedule.run(
+        row.id,
+        row.labId,
+        row.name ?? null,
+        row.cidr,
+        row.intervalMs ?? 3_600_000,
+        row.enabled === false || row.enabled === 0 ? 0 : 1,
+        row.lastRunAt ?? null,
+        row.lastResult ?? null,
+        row.lastMessage ?? null,
+        row.createdAt ?? now,
+        row.updatedAt ?? row.createdAt ?? now,
+      );
+    }
+    for (const row of snmpSyncSchedules) {
+      const now = new Date().toISOString();
+      insertSnmpSyncSchedule.run(
+        row.id,
+        row.labId,
+        row.deviceId,
+        row.profileId,
+        row.policy ?? "merge",
+        row.intervalMs ?? 86_400_000,
+        row.enabled === true || row.enabled === 1 ? 1 : 0,
+        row.lastRunAt ?? null,
+        row.lastResult ?? null,
+        row.lastMessage ?? null,
+        row.createdAt ?? now,
+        row.updatedAt ?? row.createdAt ?? now,
+      );
+    }
+    for (const row of documentationPages) {
+      const now = new Date().toISOString();
+      insertDocumentationPage.run(
+        row.id,
+        row.labId,
+        row.title,
+        row.content ?? "",
+        row.createdAt ?? now,
+        row.updatedAt ?? row.createdAt ?? now,
+      );
+    }
+    for (const row of documentationDeviceLinks) {
+      const now = new Date().toISOString();
+      insertDocumentationDeviceLink.run(
+        row.id,
+        row.documentationPageId,
+        row.deviceId,
+        row.createdAt ?? now,
+      );
+    }
+    for (const row of referenceImages) {
+      const now = new Date().toISOString();
+      insertReferenceImage.run(
+        row.id,
+        row.labId,
+        row.entityType,
+        row.entityId,
+        row.label,
+        row.fileName,
+        row.mimeType,
+        row.dataUrl,
+        row.face ?? null,
+        row.notes ?? null,
+        row.createdAt ?? now,
+        row.updatedAt ?? row.createdAt ?? now,
+      );
+    }
+    for (const row of deviceImages) {
+      const now = new Date().toISOString();
+      insertDeviceImage.run(
+        row.id,
+        row.deviceId,
+        row.label,
+        row.fileName,
+        row.mimeType,
+        row.dataUrl,
+        row.notes ?? null,
+        row.createdAt ?? now,
+        row.updatedAt ?? row.createdAt ?? now,
+      );
+    }
+    for (const row of auditLog) {
+      insertAudit.run(
+        row.id,
+        row.ts,
+        row.user,
+        row.action,
+        row.entityType,
+        row.entityId,
+        row.summary,
+      );
+    }
+    for (const row of deviceMonitors) {
+      insertDeviceMonitor.run(
+        row.id,
+        row.deviceId,
+        row.name ?? "Primary",
+        row.type,
+        row.target ?? null,
+        row.port ?? null,
+        row.path ?? null,
+        Number(row.ignoreTlsErrors ?? 0) === 1 ? 1 : 0,
+        row.snmpVersion ?? null,
+        restoredMonitorCommunity(row),
+        row.snmpOid ?? null,
+        row.snmpExpectedValue ?? null,
+        row.snmpMatchMode ?? "equals",
+        row.portId ?? null,
+        row.snmpIfIndex ?? null,
+        row.snmpCredentialId ?? null,
+        row.intervalMs ?? null,
+        row.type === "none" ? 0 : Number(row.enabled ?? 0),
+        row.sortOrder ?? 0,
+        row.lastCheckAt ?? null,
+        row.lastAlertAt ?? null,
+        row.lastResult ?? null,
+        row.lastMessage ?? null,
+      );
+    }
+    for (const row of deviceServices) {
+      const now = new Date().toISOString();
+      insertDeviceService.run(
+        row.id,
+        row.deviceId,
+        row.name,
+        row.serviceType,
+        row.ipAssignmentId ?? null,
+        row.portId ?? null,
+        row.vlanId ?? null,
+        row.monitorId ?? null,
+        row.url ?? null,
+        row.notes ?? null,
+        row.createdAt ?? now,
+        row.updatedAt ?? row.createdAt ?? now,
+      );
+    }
+    for (const row of wifiControllers) {
+      insertWifiController.run(
+        row.id,
+        row.labId,
+        row.deviceId ?? null,
+        row.name,
+        row.vendor ?? null,
+        row.model ?? null,
+        row.managementIp ?? null,
+        row.notes ?? null,
+      );
+    }
+    for (const row of wifiSsids) {
+      insertWifiSsid.run(
+        row.id,
+        row.labId,
+        row.name,
+        row.purpose ?? null,
+        row.security ?? null,
+        Number(row.hidden ?? 0),
+        row.vlanId ?? null,
+        row.color ?? null,
+      );
+    }
+    for (const row of wifiAccessPoints) {
+      insertWifiAccessPoint.run(
+        row.deviceId,
+        row.controllerId ?? null,
+        row.location ?? null,
+        row.firmwareVersion ?? null,
+        row.notes ?? null,
+      );
+    }
+    for (const row of wifiRadios) {
+      insertWifiRadio.run(
+        row.id,
+        row.apDeviceId,
+        row.slotName,
+        row.band,
+        row.channel,
+        row.channelWidth ?? null,
+        row.txPower ?? null,
+        row.notes ?? null,
+      );
+    }
+    for (const row of wifiRadioSsids) {
+      insertWifiRadioSsid.run(row.radioId, row.ssidId);
+    }
+    for (const row of wifiClientAssociations) {
+      insertWifiClientAssociation.run(
+        row.clientDeviceId,
+        row.apDeviceId,
+        row.radioId ?? null,
+        row.ssidId ?? null,
+        row.band ?? null,
+        row.channel ?? null,
+        row.signalDbm ?? null,
+        row.lastSeen ?? null,
+        row.lastRoamAt ?? null,
+        row.notes ?? null,
+      );
+    }
+    for (const row of appSettings) {
+      insertAppSetting.run(
+        row.key,
+        row.value,
+        row.updatedAt ?? new Date().toISOString(),
+      );
+    }
+
+    for (const row of ports) {
+      if (row.stackMemberId != null) db.prepare('UPDATE ports SET stackMemberId = ? WHERE id = ?').run(row.stackMemberId, row.id);
+    }
+    const restoredDeviceRows = db
+      .prepare("SELECT * FROM devices ORDER BY id")
+      .all() as RackStudioDeviceRow[];
+    for (const device of restoredDeviceRows) {
+      const current = currentRackStudioPlacement(device);
+      try {
+        const resolved = resolveRackStudioPlacement(device, current);
+        if (
+          current.roomId !== null &&
+          current.roomId !== resolved.roomId
+        ) {
+          throw new ValidationError(
+            "Stored room does not match the resolved physical placement.",
+          );
+        }
+      } catch (error) {
+        throw new ValidationError(
+          `Backup device ${device.id} has invalid Rack Studio placement: ${error instanceof Error ? error.message : "invalid placement"}`,
+          422,
+          "BACKUP_INTEGRITY_INVALID",
+        );
+      }
+    }
+    validateStackIntegrity(db);
+    const restoredAt = new Date().toISOString();
+    const restoreAuditId = createId("a");
+    insertAudit.run(
+      restoreAuditId,
+      restoredAt,
+      restoredBy,
+      "admin.restore",
+      "Backup",
+      restoreAuditId,
+      `Restored Rackpad backup exported at ${String(snapshot.exportedAt ?? "unknown time")}`,
+    );
+
+    setBootstrapState(users.length === 0);
+
+    return {
+      restored: true,
+      requiresLogin: true,
+      counts: {
+        labs: labs.length,
+        rooms: rooms.length,
+        racks: racks.length,
+        devices: devices.length,
+        virtualSwitches: virtualSwitches.length,
+        discoveredDevices: discoveredDevices.length,
+        discoveryScanSchedules: discoveryScanSchedules.length,
+        snmpSyncSchedules: snmpSyncSchedules.length,
+        documentationPages: documentationPages.length,
+        documentationDeviceLinks: documentationDeviceLinks.length,
+        deviceImages: deviceImages.length,
+        referenceImages: referenceImages.length,
+        deviceServices: deviceServices.length,
+        portTemplates: portTemplates.length,
+        hardwareTemplates: hardwareTemplates.length,
+        hardwareTemplateDefaults: hardwareTemplateDefaults.length,
+        devicePhysicalLayouts: devices.length,
+        driveBayTemplates: driveBayTemplates.length,
+        storageDrives: storageDrives.length,
+        driveSlots: driveSlots.length,
+        storagePools: storagePools.length,
+        storagePoolDrives: storagePoolDrives.length,
+        wifiControllers: wifiControllers.length,
+        wifiSsids: wifiSsids.length,
+        wifiRadios: wifiRadios.length,
+        wifiClientAssociations: wifiClientAssociations.length,
+        vlans: vlans.length,
+        subnets: subnets.length,
+        users: users.length,
+        userLabAccess: userLabAccess.length,
+      },
+    };
+  },
+);
+
+export const adminRoutes: FastifyPluginAsync = async (app) => {
+  app.get("/operations/status", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    return {
+      monitoring: monitoringOperationalStatus(),
+      discovery: discoveryOperationalStatus(),
+      dockerSync: dockerSyncOperationalStatus(),
+      snmpSync: snmpSyncOperationalStatus(),
+      nativeBackup: nativeBackupStatus(),
+    };
+  });
+  app.get("/integrity", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const subnetRows = db
+      .prepare(
+        `
+      SELECT subnets.id, subnets.labId, subnets.cidr, subnets.name,
+        (SELECT COUNT(*) FROM ipAssignments WHERE ipAssignments.subnetId = subnets.id) AS assignmentCount,
+        (SELECT COUNT(*) FROM dhcpScopes WHERE dhcpScopes.subnetId = subnets.id) AS scopeCount,
+        (SELECT COUNT(*) FROM ipZones WHERE ipZones.subnetId = subnets.id) AS zoneCount
+      FROM subnets
+      ORDER BY subnets.labId, subnets.cidr, subnets.id
+    `,
+      )
+      .all() as Array<{
+      id: string;
+      labId: string;
+      cidr: string;
+      name: string;
+      assignmentCount: number;
+      scopeCount: number;
+      zoneCount: number;
+    }>;
+    const subnetConflicts = subnetRows.flatMap((row) => {
+      const integrity = getSubnetIntegrity(row);
+      if (integrity.state === "ok") return [];
+      return [
+        {
+          id: row.id,
+          labId: row.labId,
+          cidr: row.cidr,
+          name: row.name,
+          integrity,
+          childCounts: {
+            assignments: row.assignmentCount,
+            dhcpScopes: row.scopeCount,
+            zones: row.zoneCount,
+          },
+        },
+      ];
+    });
+    return {
+      checkedAt: new Date().toISOString(),
+      subnetConflicts,
+      assignmentReferences: listAssignmentIntegrityIssues(),
+    };
+  });
+
+  app.get("/ui-settings", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    return loadUiSettings();
+  });
+
+  app.put("/ui-settings", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const body = asObject(req.body);
+    const saved = saveUiSettings({
+      defaultLanguage: normalizeLanguage(body.defaultLanguage),
+    });
+    db.prepare(
+      `
+      INSERT INTO auditLog (id, ts, user, action, entityType, entityId, summary)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+    ).run(
+      createId("a"),
+      new Date().toISOString(),
+      req.authUser.username,
+      "admin.ui_settings.update",
+      "UiSettings",
+      "ui-settings",
+      `Updated default language to ${saved.defaultLanguage}.`,
+    );
+    return saved;
+  });
+
+  app.get("/alert-settings", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    return loadAlertSettings();
+  });
+
+  app.get("/native-backups", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const status = nativeBackupStatus();
+    return { ...status, backups: listNativeBackups() };
+  });
+
+  app.put("/native-backups/settings", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const body = asObject(req.body);
+    const nextSettings = {
+      enabled: optionalBoolean(body, "enabled") ?? false,
+      intervalHours:
+        optionalInteger(body, "intervalHours", { min: 1, max: 8760 }) ?? 24,
+      retentionCount:
+        optionalInteger(body, "retentionCount", { min: 1, max: 365 }) ?? 7,
+    };
+    if (nextSettings.enabled && !nativeBackupStatus().configured) {
+      return reply.status(409).send({
+        error:
+          "Configure RACKPAD_NATIVE_BACKUP_DIR before enabling scheduled native backups.",
+      });
+    }
+    const settings = saveNativeBackupSettings(nextSettings);
+    writeAdminAudit(
+      req.authUser.username,
+      "admin.native_backup.settings",
+      "Updated native backup schedule settings.",
+    );
+    return settings;
+  });
+
+  app.post("/native-backups", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    if (!nativeBackupStatus().configured) {
+      return reply
+        .status(409)
+        .send({ error: "Native backup directory is not configured." });
+    }
+    try {
+      const backup = await createNativeBackup(req.authUser.username);
+      return reply.status(201).send(backup);
+    } catch (error) {
+      if (error instanceof NativeBackupBusyError) {
+        return reply.status(409).send({ error: error.message });
+      }
+      throw error;
+    }
+  });
+
+  app.get<{ Params: { name: string } }>(
+    "/native-backups/:name/download",
+    async (req, reply) => {
+      if (!requireAdmin(req, reply)) return;
+      try {
+        const stream = nativeBackupReadStream(req.params.name);
+        reply.header("Content-Type", "application/vnd.sqlite3");
+        reply.header(
+          "Content-Disposition",
+          `attachment; filename="${req.params.name}"`,
+        );
+        return reply.send(stream);
+      } catch {
+        return reply
+          .status(400)
+          .send({ error: "Invalid native backup selection." });
+      }
+    },
+  );
+
+  app.delete<{ Params: { name: string } }>(
+    "/native-backups/:name",
+    async (req, reply) => {
+      if (!requireAdmin(req, reply)) return;
+      try {
+        deleteNativeBackup(req.params.name);
+      } catch {
+        return reply
+          .status(400)
+          .send({ error: "Invalid native backup selection." });
+      }
+      writeAdminAudit(
+        req.authUser.username,
+        "admin.native_backup.delete",
+        "Deleted a native database snapshot.",
+      );
+      return reply.status(204).send();
+    },
+  );
+
+  app.put("/alert-settings", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const body = asObject(req.body);
+    const saved = saveAlertSettings({
+      enabled: optionalBoolean(body, "enabled") ?? false,
+      notifyOnDown: optionalBoolean(body, "notifyOnDown") ?? true,
+      notifyOnRecovery: optionalBoolean(body, "notifyOnRecovery") ?? true,
+      repeatWhileOffline: optionalBoolean(body, "repeatWhileOffline") ?? false,
+      repeatIntervalMinutes:
+        optionalInteger(body, "repeatIntervalMinutes", {
+          min: 1,
+          max: 10080,
+        }) ?? 60,
+      discordWebhookUrl: optionalString(body, "discordWebhookUrl", {
+        maxLength: 1000,
+      }),
+      telegramBotToken: optionalString(body, "telegramBotToken", {
+        maxLength: 255,
+      }),
+      telegramChatId: optionalString(body, "telegramChatId", {
+        maxLength: 255,
+      }),
+      smtpHost: optionalString(body, "smtpHost", { maxLength: 255 }),
+      smtpPort: optionalInteger(body, "smtpPort", { min: 1, max: 65535 }),
+      smtpSecure: optionalBoolean(body, "smtpSecure") ?? false,
+      smtpUsername: optionalString(body, "smtpUsername", { maxLength: 255 }),
+      smtpPassword: optionalString(body, "smtpPassword", {
+        maxLength: 255,
+        allowEmpty: true,
+      }),
+      smtpFrom: optionalString(body, "smtpFrom", { maxLength: 255 }),
+      smtpTo: optionalString(body, "smtpTo", { maxLength: 1000 }),
+    });
+    db.prepare(
+      `
+      INSERT INTO auditLog (id, ts, user, action, entityType, entityId, summary)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+    ).run(
+      createId("a"),
+      new Date().toISOString(),
+      req.authUser.username,
+      "alert.settings.update",
+      "AlertSettings",
+      "alert-settings",
+      "Updated notification channels and delivery controls.",
+    );
+    return saved;
+  });
+
+  app.post("/alert-settings/test", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    return sendTestAlert(req.authUser.username);
+  });
+
+  app.get("/export", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+
+    const exportedAt = new Date().toISOString();
+    const filename = createBackupFilename(exportedAt);
+    const snapshot = exportBackupSnapshot(
+      exportedAt,
+      req.authUser.username,
+      filename,
+    );
+
+    reply.header("Cache-Control", "no-store");
+    reply.header("Content-Type", "application/json; charset=utf-8");
+    reply.header("Content-Disposition", `attachment; filename="${filename}"`);
+
+    return snapshot;
+  });
+
+  app.post("/restore", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const snapshot = asObject(req.body);
+    return reply.send(restoreBackupSnapshot(snapshot, req.authUser.username));
+  });
+};

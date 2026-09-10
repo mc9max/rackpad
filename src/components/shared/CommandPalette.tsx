@@ -1,0 +1,588 @@
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
+import { useNavigate } from "react-router-dom";
+import { AnimatePresence, motion } from "motion/react";
+import {
+  Search,
+  Server,
+  Hash,
+  Network,
+  LayoutDashboard,
+  Cable,
+  Workflow,
+  Boxes,
+  X,
+  ChevronRight,
+  Activity,
+  BookOpen,
+  FileText,
+  ScrollText,
+  Route,
+  Shield,
+  UploadCloud,
+  HardDrive,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import {
+  formatDeviceAddress,
+  matchesMacAwareSearch,
+} from "@/lib/network-labels";
+import { cn } from "@/lib/utils";
+import { EmptyState } from "@/components/shared/EmptyState";
+import { useStore } from "@/lib/store";
+import { useI18n } from "@/i18n";
+import { localizedDeviceTypeIdLabel } from "@/lib/device-types";
+
+interface SearchResult {
+  id: string;
+  group: "Pages" | "Devices" | "Drives" | "Networks" | "IPs";
+  title: string;
+  subtitle?: string;
+  href: string;
+  Icon: LucideIcon;
+  accent?: string;
+  keywords?: string[];
+}
+
+interface CommandPaletteProps {
+  open: boolean;
+  onClose: () => void;
+}
+
+export function CommandPalette({ open, onClose }: CommandPaletteProps) {
+  const { t } = useI18n();
+  const navigate = useNavigate();
+  const [query, setQuery] = useState("");
+  const [activeIdx, setActiveIdx] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  const devices = useStore((s) => s.devices);
+  const deviceTypes = useStore((s) => s.deviceTypes);
+  const documentationPages = useStore((s) => s.documentationPages);
+  const storageDrives = useStore((s) => s.storageDrives);
+  const vlans = useStore((s) => s.vlans);
+  const ipAssignments = useStore((s) => s.ipAssignments);
+  const deviceById = useMemo(
+    () => new Map(devices.map((device) => [device.id, device])),
+    [devices],
+  );
+
+  const pages = useMemo<SearchResult[]>(
+    () => [
+      {
+        id: "p-dash",
+        group: "Pages",
+        title: t("Dashboard"),
+        subtitle: t("Overview"),
+        href: "/",
+        Icon: LayoutDashboard,
+      },
+      {
+        id: "p-racks",
+        group: "Pages",
+        title: t("Racks / Rooms"),
+        subtitle: "Physical rooms and racks",
+        href: "/racks",
+        Icon: Server,
+      },
+      {
+        id: "p-devices",
+        group: "Pages",
+        title: t("Devices"),
+        subtitle: t("Inventory"),
+        href: "/devices",
+        Icon: Boxes,
+      },
+      {
+        id: "p-monitoring",
+        group: "Pages",
+        title: t("Monitoring"),
+        subtitle: "Health overview",
+        href: "/monitoring",
+        Icon: Activity,
+      },
+      {
+        id: "p-storage",
+        group: "Pages",
+        title: t("Storage"),
+        subtitle: t("Physical drives, device bays, and logical pools"),
+        href: "/storage",
+        Icon: HardDrive,
+        keywords: ["storage", "drive", "disk", "pool", "raid", "jbod"],
+      },
+      {
+        id: "p-imports",
+        group: "Pages",
+        title: t("Imports"),
+        subtitle: "Hyper-V and Proxmox import",
+        href: "/imports",
+        Icon: UploadCloud,
+      },
+      {
+        id: "p-ports",
+        group: "Pages",
+        title: t("Ports"),
+        subtitle: "Port management",
+        href: "/ports",
+        Icon: Cable,
+      },
+      {
+        id: "p-cables",
+        group: "Pages",
+        title: t("Cables"),
+        subtitle: "Connections",
+        href: "/cables",
+        Icon: Workflow,
+      },
+      {
+        id: "p-visualizer",
+        group: "Pages",
+        title: t("Visualizer"),
+        subtitle: "Rack cable map",
+        href: "/visualizer",
+        Icon: Route,
+      },
+      {
+        id: "p-networks",
+        group: "Pages",
+        title: t("Networks"),
+        subtitle: "VLANs and address management",
+        href: "/networks",
+        Icon: Network,
+        keywords: [
+          "network",
+          "networks",
+          "ipam",
+          "vlan",
+          "vlans",
+          "subnet",
+          "subnets",
+          "dhcp",
+        ],
+      },
+      {
+        id: "p-reports",
+        group: "Pages",
+        title: t("Reports"),
+        subtitle: "Export and print",
+        href: "/reports",
+        Icon: FileText,
+      },
+      {
+        id: "p-audit",
+        group: "Pages",
+        title: t("Audit log"),
+        subtitle: "Recent activity",
+        href: "/audit-log",
+        Icon: ScrollText,
+      },
+      {
+        id: "p-documentation",
+        group: "Pages",
+        title: t("Documentation"),
+        subtitle: "Markdown notes",
+        href: "/documentation",
+        Icon: BookOpen,
+      },
+      {
+        id: "p-admin",
+        group: "Pages",
+        title: t("Admin"),
+        subtitle: t("Accounts and settings"),
+        href: "/admin",
+        Icon: Shield,
+      },
+    ],
+    [t],
+  );
+
+  const results = useMemo<SearchResult[]>(() => {
+    const q = query.toLowerCase().trim();
+    if (!q) return pages;
+
+    const out: SearchResult[] = [];
+
+    for (const device of devices) {
+      const haystack = [
+        device.hostname,
+        device.displayName,
+        device.manufacturer,
+        device.model,
+        device.managementIp,
+        device.macAddress,
+        ...(device.tags ?? []),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+      if (matchesMacAwareSearch(haystack, q)) {
+        out.push({
+          id: device.id,
+          group: "Devices",
+          title: device.hostname,
+          subtitle: [
+            localizedDeviceTypeIdLabel(device.deviceType, deviceTypes, t),
+            device.manufacturer,
+            device.model,
+            formatDeviceAddress(device),
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          href: `/devices/${device.id}`,
+          Icon: Server,
+        });
+      }
+    }
+
+    for (const drive of storageDrives) {
+      const haystack = [drive.serial, drive.manufacturer, drive.model]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      if (haystack.includes(q)) {
+        out.push({
+          id: `drive-${drive.id}`,
+          group: "Drives",
+          title:
+            [drive.manufacturer, drive.model].filter(Boolean).join(" ") ||
+            drive.serial ||
+            t("Unknown drive"),
+          subtitle: [drive.serial, drive.deviceHostname, drive.slotName]
+            .filter(Boolean)
+            .join(" · "),
+          href: `/storage?tab=drives&driveId=${drive.id}`,
+          Icon: HardDrive,
+        });
+      }
+    }
+
+    for (const vlan of vlans) {
+      const haystack = [String(vlan.vlanId), vlan.name, vlan.description]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      if (haystack.includes(q)) {
+        out.push({
+          id: vlan.id,
+          group: "Networks",
+          title: `VLAN ${vlan.vlanId} · ${vlan.name}`,
+          subtitle: vlan.description,
+          href: `/networks?vlanId=${vlan.id}`,
+          Icon: Hash,
+          accent: vlan.color,
+        });
+      }
+    }
+
+    for (const assignment of ipAssignments) {
+      const owner =
+        !assignment.integrity || assignment.integrity.state === "ok"
+          ? deviceById.get(assignment.deviceId ?? "")
+          : undefined;
+      const haystack = [
+        assignment.ipAddress,
+        assignment.hostname,
+        assignment.description,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      if (haystack.includes(q)) {
+        out.push({
+          id: assignment.id,
+          group: "IPs",
+          title: assignment.ipAddress,
+          subtitle: [
+            owner?.hostname ?? assignment.hostname,
+            assignment.assignmentType,
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          href: owner
+            ? `/devices/${owner.id}?tab=network`
+            : `/networks?subnetId=${assignment.subnetId}`,
+          Icon: Network,
+        });
+      }
+    }
+
+    for (const page of documentationPages) {
+      const haystack = [page.title, page.content]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      if (haystack.includes(q)) {
+        out.push({
+          id: `doc-${page.id}`,
+          group: "Pages",
+          title: page.title,
+          subtitle: t("Documentation"),
+          href: `/documentation?pageId=${page.id}`,
+          Icon: BookOpen,
+        });
+      }
+    }
+
+    for (const page of pages) {
+      const haystack = [page.title, ...(page.keywords ?? [])]
+        .join(" ")
+        .toLowerCase();
+      if (haystack.includes(q)) out.push(page);
+    }
+
+    return out;
+  }, [
+    deviceById,
+    deviceTypes,
+    devices,
+    documentationPages,
+    ipAssignments,
+    pages,
+    query,
+    storageDrives,
+    t,
+    vlans,
+  ]);
+
+  const grouped = useMemo(() => {
+    const groups: {
+      label: string;
+      items: { result: SearchResult; flatIdx: number }[];
+    }[] = [];
+    const seen = new Set<string>();
+    let flatIdx = 0;
+
+    for (const result of results) {
+      if (!seen.has(result.group)) {
+        seen.add(result.group);
+        groups.push({ label: result.group, items: [] });
+      }
+      groups[groups.length - 1].items.push({ result, flatIdx });
+      flatIdx += 1;
+    }
+
+    return groups;
+  }, [results]);
+
+  useEffect(() => {
+    if (open) {
+      setQuery("");
+      setActiveIdx(0);
+      const timer = setTimeout(() => inputRef.current?.focus(), 30);
+      return () => clearTimeout(timer);
+    }
+  }, [open]);
+
+  useEffect(() => {
+    setActiveIdx(0);
+  }, [results.length]);
+
+  useEffect(() => {
+    const el = listRef.current?.querySelector(
+      '[data-active="true"]',
+    ) as HTMLElement | null;
+    el?.scrollIntoView({ block: "nearest" });
+  }, [activeIdx]);
+
+  function select(result: SearchResult) {
+    navigate(result.href);
+    onClose();
+  }
+
+  function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        setActiveIdx((i) => Math.min(i + 1, results.length - 1));
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        setActiveIdx((i) => Math.max(i - 1, 0));
+        break;
+      case "Enter":
+        if (results[activeIdx]) select(results[activeIdx]);
+        break;
+      case "Escape":
+        onClose();
+        break;
+    }
+  }
+
+  return (
+    <AnimatePresence>
+      {open && (
+        <>
+          <motion.div
+            key="palette-backdrop"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="fixed inset-0 z-50 bg-black/55 backdrop-blur-[2px]"
+            onClick={onClose}
+          />
+
+          <motion.div
+            key="palette-panel"
+            initial={{ opacity: 0, scale: 0.97, y: -10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.97, y: -10 }}
+            transition={{ duration: 0.15, ease: [0.22, 1, 0.36, 1] }}
+            className="fixed left-1/2 top-[14%] z-50 w-full max-w-[560px] -translate-x-1/2 px-4"
+          >
+            <div
+              className="overflow-hidden rounded-[var(--radius-md)] border border-[var(--color-line-strong)]"
+              style={{
+                background: "var(--color-bg-2)",
+                boxShadow:
+                  "0 24px 64px rgb(0 0 0 / 0.6), 0 0 0 1px rgb(255 255 255 / 0.03) inset",
+              }}
+            >
+              <div className="flex items-center gap-3 border-b border-[var(--color-line)] px-4 py-3">
+                <Search className="size-4 shrink-0 text-[var(--color-fg-subtle)]" />
+                <input
+                  ref={inputRef}
+                  type="text"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder={t("Search commands")}
+                  className="flex-1 bg-transparent text-sm text-[var(--color-fg)] placeholder:text-[var(--color-fg-faint)] focus:outline-none"
+                />
+                {query ? (
+                  <button
+                    onClick={() => {
+                      setQuery("");
+                      inputRef.current?.focus();
+                    }}
+                    className="text-[var(--color-fg-faint)] transition-colors hover:text-[var(--color-fg-subtle)]"
+                    tabIndex={-1}
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                ) : null}
+                <kbd className="rounded-[var(--radius-xs)] border border-[var(--color-line-strong)] px-1.5 py-0.5 font-mono text-[10px] leading-none text-[var(--color-fg-faint)]">
+                  esc
+                </kbd>
+              </div>
+
+              <div ref={listRef} className="max-h-[340px] overflow-y-auto">
+                {results.length === 0 ? (
+                  <EmptyState
+                    icon={Search}
+                    title={t("No results")}
+                    description={t('"{query}"', { query: query })}
+                  />
+                ) : (
+                  <div className="py-1.5">
+                    {grouped.map((group) => (
+                      <div key={group.label}>
+                        <div className="flex items-center gap-2 px-4 pb-1 pt-2">
+                          <span className="font-mono text-[9px] uppercase tracking-[0.18em] text-[var(--color-fg-faint)]">
+                            {group.label === "Devices"
+                              ? t("Devices")
+                              : group.label === "Drives"
+                                ? t("Drives")
+                                : group.label === "Networks"
+                                  ? t("Networks")
+                                  : group.label}
+                          </span>
+                          <span className="flex-1 border-t border-[var(--color-line)]" />
+                        </div>
+
+                        {group.items.map(({ result, flatIdx }) => {
+                          const isActive = flatIdx === activeIdx;
+                          return (
+                            <button
+                              key={result.id}
+                              data-active={isActive}
+                              onClick={() => select(result)}
+                              onMouseEnter={() => setActiveIdx(flatIdx)}
+                              className={cn(
+                                "flex w-full items-center gap-3 px-4 py-2 text-left transition-colors",
+                                isActive
+                                  ? "bg-[var(--color-surface)]"
+                                  : "hover:bg-[var(--color-surface)]/60",
+                              )}
+                            >
+                              <div
+                                className="grid size-7 shrink-0 place-items-center rounded-[var(--radius-sm)] border border-[var(--color-line)]"
+                                style={{
+                                  background: result.accent
+                                    ? `${result.accent}18`
+                                    : "var(--color-surface)",
+                                }}
+                              >
+                                <result.Icon
+                                  className="size-3.5"
+                                  style={{
+                                    color:
+                                      result.accent ?? "var(--color-fg-subtle)",
+                                  }}
+                                />
+                              </div>
+
+                              <div className="min-w-0 flex-1">
+                                <div
+                                  className="truncate text-sm"
+                                  style={{
+                                    color: isActive
+                                      ? "var(--color-fg)"
+                                      : "var(--color-fg-muted)",
+                                  }}
+                                >
+                                  {result.title}
+                                </div>
+                                {result.subtitle && (
+                                  <div className="truncate font-mono text-[10px] text-[var(--color-fg-faint)]">
+                                    {result.subtitle}
+                                  </div>
+                                )}
+                              </div>
+
+                              {isActive && (
+                                <ChevronRight className="size-3.5 shrink-0 text-[var(--color-accent)]" />
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center gap-4 border-t border-[var(--color-line)] px-4 py-2">
+                <KbdHint keys="↑↓" label={t("Navigate")} />
+                <KbdHint keys="↵" label={t("Open")} />
+                <KbdHint keys="esc" label={t("Close")} />
+                <span className="ml-auto font-mono text-[10px] text-[var(--color-fg-faint)]">
+                  {results.length} {t("result")}
+                  {results.length !== 1 ? t("s") : ""}
+                </span>
+              </div>
+            </div>
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>
+  );
+}
+
+function KbdHint({ keys, label }: { keys: string; label: string }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <kbd className="rounded-[var(--radius-xs)] border border-[var(--color-line-strong)] px-1.5 py-0.5 font-mono text-[10px] leading-none text-[var(--color-fg-faint)]">
+        {keys}
+      </kbd>
+      <span className="text-[10px] text-[var(--color-fg-faint)]">{label}</span>
+    </div>
+  );
+}

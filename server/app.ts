@@ -1,0 +1,474 @@
+import Fastify from "fastify";
+import cors from "@fastify/cors";
+import rateLimit from "@fastify/rate-limit";
+import staticPlugin from "@fastify/static";
+import path from "node:path";
+import net from "node:net";
+import ipaddr from "ipaddr.js";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { authRoutes } from "./routes/auth.js";
+import { usersRoutes } from "./routes/users.js";
+import { labsRoutes } from "./routes/labs.js";
+import { roomsRoutes } from "./routes/rooms.js";
+import { racksRoutes } from "./routes/racks.js";
+import { deviceStacksRoutes } from "./routes/device-stacks.js";
+import { devicesRoutes } from "./routes/devices.js";
+import { deviceTypesRoutes } from "./routes/device-types.js";
+import { portsRoutes } from "./routes/ports.js";
+import { portAggregatesRoutes } from "./routes/port-aggregates.js";
+import { cablesRoutes } from "./routes/cables.js";
+import { vlansRoutes } from "./routes/vlans.js";
+import { ipamRoutes } from "./routes/ipam.js";
+import { auditRoutes } from "./routes/audit.js";
+import { monitoringRoutes } from "./routes/monitoring.js";
+import { snmpCredentialsRoutes } from "./routes/snmp-credentials.js";
+import { snmpTrapsRoutes } from "./routes/snmp-traps.js";
+import { snmpSyncRoutes } from "./routes/snmp-sync.js";
+import { adminRoutes } from "./routes/admin.js";
+import { discoveryRoutes } from "./routes/discovery.js";
+import { wifiRoutes } from "./routes/wifi.js";
+import { virtualSwitchesRoutes } from "./routes/virtual-switches.js";
+import { documentationRoutes } from "./routes/documentation.js";
+import { deviceImagesRoutes } from "./routes/device-images.js";
+import { deviceServicesRoutes } from "./routes/device-services.js";
+import { referenceImagesRoutes } from "./routes/reference-images.js";
+import { importsRoutes } from "./routes/imports.js";
+import { integrationsRoutes } from "./routes/integrations.js";
+import { storageRoutes } from "./routes/storage.js";
+import {
+  hardwareTemplatesRoutes,
+  physicalLayoutsRoutes,
+} from "./routes/physical-layouts.js";
+import { rackStudioRoutes } from "./routes/rack-studio.js";
+import { getAuthToken, lookupSession, needsBootstrap } from "./lib/auth.js";
+import { fetchUserLabAccess } from "./lib/lab-access.js";
+import { ValidationError } from "./lib/validation.js";
+import { normalizeSafeSubnetCidrs } from "./lib/subnet-integrity.js";
+import { CONTENT_SECURITY_POLICY } from "./security-headers.js";
+import {
+  configureRouteAuthorization,
+  requestRouteAuthorization,
+} from "./route-authorization.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DIST_DIR = path.resolve(__dirname, "../dist");
+const HYPERV_COLLECTOR_PATH = path.resolve(
+  __dirname,
+  "../scripts/collect-hyperv.ps1",
+);
+const PROXMOX_COLLECTOR_PATH = path.resolve(
+  __dirname,
+  "../scripts/collect-proxmox.sh",
+);
+const DEV_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const DEFAULT_RATE_LIMIT_MAX = 600;
+const DEFAULT_RATE_LIMIT_WINDOW = "1 minute";
+
+function envFlag(name: string, fallback = false) {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (!raw) return fallback;
+  return ["1", "true", "yes", "on"].includes(raw);
+}
+
+export function parseTrustProxySetting(value: string | undefined): false | string[] {
+  const normalized = value?.trim().toLowerCase();
+
+  if (!normalized || ["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+
+  const addresses = normalized.split(/[\s,]+/).filter(Boolean);
+  if (!addresses.length || !addresses.every((address) => {
+    if (net.isIP(address)) return true;
+    const [ip, prefix, extra] = address.split("/");
+    if (extra !== undefined || !ip || !net.isIP(ip) || !prefix || !/^\d+$/.test(prefix)) return false;
+    try {
+      ipaddr.parseCIDR(address);
+      return Number(prefix) > 0;
+    } catch {
+      return false;
+    }
+  })) {
+    return false;
+  }
+  return addresses;
+}
+
+function envInteger(
+  name: string,
+  fallback: number,
+  options: { min?: number; max?: number } = {},
+) {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isInteger(parsed)) return fallback;
+  return Math.min(
+    options.max ?? parsed,
+    Math.max(options.min ?? parsed, parsed),
+  );
+}
+
+function parseDelimitedEnv(name: string) {
+  const raw = process.env[name];
+  if (!raw) return [];
+  return raw
+    .split(/[\s,]+/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function normalizeOrigin(value: string) {
+  try {
+    return new URL(value.trim()).origin.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function normalizeHost(value: string) {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed) return null;
+  if (trimmed.includes("://")) {
+    try {
+      return new URL(trimmed).host.toLowerCase();
+    } catch {
+      return null;
+    }
+  }
+  return trimmed.toLowerCase();
+}
+
+function stripHostPort(host: string) {
+  if (host.startsWith("[")) {
+    const match = host.match(/^\[[^\]]+\]/);
+    return match ? match[0].toLowerCase() : host.toLowerCase();
+  }
+  return host.split(":")[0].toLowerCase();
+}
+
+function hostAllowed(host: string | null, trustedHosts: Set<string>) {
+  if (!host) return false;
+  const hostOnly = stripHostPort(host);
+  if (LOOPBACK_HOSTS.has(hostOnly)) return true;
+  for (const allowed of trustedHosts) {
+    if (allowed === host) return true;
+    if (stripHostPort(allowed) === hostOnly) return true;
+  }
+  return false;
+}
+
+function getRequestOrigin(headers: Record<string, unknown>) {
+  const raw = headers.origin;
+  if (!raw) return null;
+  return normalizeOrigin(String(raw));
+}
+
+export async function createApp() {
+  normalizeSafeSubnetCidrs();
+  const trustedHosts = new Set(
+    parseDelimitedEnv("TRUSTED_HOSTS")
+      .map(normalizeHost)
+      .filter((value): value is string => Boolean(value)),
+  );
+  const trustedOrigins = new Set(
+    parseDelimitedEnv("TRUSTED_ORIGINS")
+      .map(normalizeOrigin)
+      .filter((value): value is string => Boolean(value)),
+  );
+
+  const trustProxy = parseTrustProxySetting(process.env.TRUST_PROXY);
+  const app = Fastify({
+    bodyLimit: 20 * 1024 * 1024,
+    trustProxy,
+    logger:
+      process.env.NODE_ENV === "test"
+        ? false
+        : process.env.NODE_ENV === "production"
+        ? true
+        : {
+            transport: {
+              target: "pino-pretty",
+              options: {
+                colorize: true,
+                translateTime: "HH:MM:ss",
+                ignore: "pid,hostname",
+              },
+            },
+          },
+  });
+
+  if (trustProxy === false && process.env.TRUST_PROXY?.trim() &&
+      !["0", "false", "no", "off"].includes(process.env.TRUST_PROXY.trim().toLowerCase())) {
+    app.log.warn("TRUST_PROXY is disabled: configure explicit trusted proxy IPs/CIDRs; hop counts and truthy aliases are no longer supported.");
+  }
+
+  app.decorateRequest("authUser", null);
+  app.decorateRequest("sessionId", null);
+  app.decorateRequest("labAccess", null);
+  configureRouteAuthorization(app);
+
+  if (!envFlag("RACKPAD_RATE_LIMIT_DISABLED")) {
+    await app.register(rateLimit, {
+      max: envInteger("RACKPAD_RATE_LIMIT_MAX", DEFAULT_RATE_LIMIT_MAX, {
+        min: 1,
+        max: 100_000,
+      }),
+      timeWindow:
+        process.env.RACKPAD_RATE_LIMIT_WINDOW?.trim() ||
+        DEFAULT_RATE_LIMIT_WINDOW,
+    });
+  }
+
+  await app.register(cors, {
+    origin:
+      process.env.NODE_ENV === "production"
+        ? (origin, callback) => {
+            if (!origin) {
+              callback(null, true);
+              return;
+            }
+            const normalized = normalizeOrigin(origin);
+            callback(null, normalized ? trustedOrigins.has(normalized) : false);
+          }
+        : [...DEV_ORIGINS],
+  });
+
+  app.addHook("onSend", async (req, reply, payload) => {
+    reply.header("X-Frame-Options", "DENY");
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.header("Referrer-Policy", "no-referrer");
+    reply.header("Cross-Origin-Opener-Policy", "same-origin");
+    reply.header("Cross-Origin-Resource-Policy", "same-origin");
+    reply.header("X-DNS-Prefetch-Control", "off");
+    reply.header(
+      "Permissions-Policy",
+      "camera=(), geolocation=(), microphone=()",
+    );
+    reply.header(
+      "Content-Security-Policy",
+      CONTENT_SECURITY_POLICY,
+    );
+    if (req.routeOptions.url?.startsWith("/api/") || req.url.startsWith("/api/")) {
+      reply.header("Cache-Control", "no-store");
+    }
+    if (req.protocol === "https") {
+      reply.header(
+        "Strict-Transport-Security",
+        "max-age=31536000; includeSubDomains",
+      );
+    }
+    return payload;
+  });
+
+  app.setErrorHandler((error, _req, reply) => {
+    if (error instanceof ValidationError) {
+      reply.status(error.statusCode).send({
+        error: error.message,
+        ...(error.code ? { code: error.code } : {}),
+        ...(error.details ?? {}),
+      });
+      return;
+    }
+
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "statusCode" in error &&
+      error.statusCode === 429
+    ) {
+      reply.status(429).send({ error: "Too many requests. Try again later." });
+      return;
+    }
+
+    if (
+      error instanceof Error &&
+      /UNIQUE constraint failed/i.test(error.message)
+    ) {
+      reply
+        .status(409)
+        .send({ error: "That record conflicts with an existing value." });
+      return;
+    }
+
+    // A referenced FK record (labId, subnetId, etc.) does not exist.
+    if (
+      error instanceof Error &&
+      /FOREIGN KEY constraint failed/i.test(error.message)
+    ) {
+      reply.status(422).send({ error: "A referenced record does not exist." });
+      return;
+    }
+
+    // Catches any NOT NULL violation that slips past route-level guards.
+    if (
+      error instanceof Error &&
+      /NOT NULL constraint failed/i.test(error.message)
+    ) {
+      reply.status(400).send({ error: "A required field is missing." });
+      return;
+    }
+
+    reply.status(500).send({ error: "Internal server error." });
+  });
+
+  app.get("/api/health", async () => {
+    const { getSnmpTrapReceiverStatus } = await import("./lib/snmp-traps.js");
+    return { ok: true, snmpTraps: getSnmpTrapReceiverStatus() };
+  });
+  app.get("/api/imports/hyperv-collector", async (_req, reply) => {
+    if (!existsSync(HYPERV_COLLECTOR_PATH)) {
+      reply.status(404).send({
+        error: "Hyper-V collector script is not available in this build.",
+      });
+      return;
+    }
+
+    reply
+      .header("Content-Type", "text/plain; charset=utf-8")
+      .header(
+        "Content-Disposition",
+        'attachment; filename="collect-hyperv.ps1"',
+      )
+      .send(readFileSync(HYPERV_COLLECTOR_PATH, "utf8"));
+  });
+  app.get("/api/imports/proxmox-collector", async (_req, reply) => {
+    if (!existsSync(PROXMOX_COLLECTOR_PATH)) {
+      reply.status(404).send({
+        error: "Proxmox collector script is not available in this build.",
+      });
+      return;
+    }
+
+    reply
+      .header("Content-Type", "text/x-shellscript; charset=utf-8")
+      .header(
+        "Content-Disposition",
+        'attachment; filename="collect-proxmox.sh"',
+      )
+      .send(readFileSync(PROXMOX_COLLECTOR_PATH, "utf8"));
+  });
+
+  app.addHook("onRequest", async (req, reply) => {
+    if (process.env.NODE_ENV === "production" && trustedHosts.size > 0) {
+      const requestHost = normalizeHost(req.host);
+      if (!hostAllowed(requestHost, trustedHosts)) {
+        return reply
+          .status(400)
+          .send({
+            error: "Request host is not allowed by this Rackpad deployment.",
+          });
+      }
+    }
+
+    if (process.env.NODE_ENV === "production" && trustedOrigins.size > 0) {
+      const requestOrigin = getRequestOrigin(
+        req.headers as Record<string, unknown>,
+      );
+      if (requestOrigin && !trustedOrigins.has(requestOrigin)) {
+        return reply
+          .status(403)
+          .send({
+            error: "Request origin is not allowed by this Rackpad deployment.",
+          });
+      }
+    }
+
+    // Matched route metadata is authoritative even when the URL is encoded.
+    if (!req.routeOptions.url?.startsWith("/api/") && !req.url.startsWith("/api/")) return;
+    const authorization = !req.routeOptions.url?.startsWith("/api/")
+      ? ({ kind: "authenticated" } as const)
+      : requestRouteAuthorization(req);
+    if (authorization.kind === "public") return;
+
+    if (needsBootstrap()) {
+      return reply
+        .status(503)
+        .send({
+          error:
+            "Authentication is not configured yet. Create the initial admin account first.",
+        });
+    }
+
+    const token = getAuthToken(req);
+    if (!token) {
+      return reply.status(401).send({ error: "Authentication required." });
+    }
+
+    const session = lookupSession(token);
+    if (!session) {
+      return reply.status(401).send({ error: "Session expired or invalid." });
+    }
+
+    req.authUser = session;
+    req.sessionId = session.sessionId;
+    req.labAccess =
+      session.role === "admin" ? [] : fetchUserLabAccess(session.id);
+    if (authorization.kind === "admin" && session.role !== "admin") {
+      return reply
+        .status(403)
+        .send({ error: authorization.denialMessage });
+    }
+  });
+
+  await app.register(authRoutes, { prefix: "/api/auth" });
+  await app.register(usersRoutes, { prefix: "/api/users" });
+  await app.register(labsRoutes, { prefix: "/api/labs" });
+  await app.register(roomsRoutes, { prefix: "/api/rooms" });
+  await app.register(racksRoutes, { prefix: "/api/racks" });
+  await app.register(devicesRoutes, { prefix: "/api/devices" });
+  await app.register(deviceStacksRoutes, { prefix: "/api/devices" });
+  await app.register(deviceTypesRoutes, { prefix: "/api/device-types" });
+  await app.register(portsRoutes, { prefix: "/api/ports" });
+  await app.register(portAggregatesRoutes, { prefix: "/api/port-aggregates" });
+  await app.register(cablesRoutes, { prefix: "/api/port-links" });
+  await app.register(vlansRoutes, { prefix: "/api/vlans" });
+  await app.register(ipamRoutes, { prefix: "/api" });
+  await app.register(auditRoutes, { prefix: "/api/audit-log" });
+  await app.register(monitoringRoutes, { prefix: "/api/device-monitors" });
+  await app.register(snmpCredentialsRoutes, { prefix: "/api/snmp-credentials" });
+  await app.register(snmpTrapsRoutes, { prefix: "/api/snmp-traps" });
+  await app.register(snmpSyncRoutes, { prefix: "/api/snmp-sync" });
+  await app.register(discoveryRoutes, { prefix: "/api/discovery" });
+  await app.register(wifiRoutes, { prefix: "/api/wifi" });
+  await app.register(virtualSwitchesRoutes, {
+    prefix: "/api/virtual-switches",
+  });
+  await app.register(documentationRoutes, { prefix: "/api/documentation" });
+  await app.register(deviceImagesRoutes, { prefix: "/api/device-images" });
+  await app.register(deviceServicesRoutes, { prefix: "/api/device-services" });
+  await app.register(referenceImagesRoutes, { prefix: "/api/reference-images" });
+  await app.register(adminRoutes, { prefix: "/api/admin" });
+  await app.register(importsRoutes, { prefix: "/api/imports" });
+  await app.register(integrationsRoutes, { prefix: "/api/integrations" });
+  await app.register(storageRoutes, { prefix: "/api/storage" });
+  await app.register(hardwareTemplatesRoutes, {
+    prefix: "/api/hardware-templates",
+  });
+  await app.register(physicalLayoutsRoutes, {
+    prefix: "/api/physical-layouts",
+  });
+  await app.register(rackStudioRoutes, { prefix: "/api/rack-studio" });
+
+  if (existsSync(DIST_DIR)) {
+    await app.register(staticPlugin, {
+      root: DIST_DIR,
+      prefix: "/",
+    });
+
+    app.setNotFoundHandler((req, reply) => {
+      if (req.method === "GET" && !req.url.startsWith("/api/")) {
+        return reply.sendFile("index.html", DIST_DIR);
+      }
+      reply.status(404).send({ error: "Not found" });
+    });
+  } else {
+    app.get("/", async () => ({
+      message: "Rackpad API running. Frontend served by Vite on :5173",
+    }));
+  }
+
+  return app;
+}

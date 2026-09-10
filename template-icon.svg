@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#4f46e5"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="800" rx="120" fill="url(#bg)"/>
+  <g fill="#ffffff" stroke="#ffffff" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="180" y="140" width="440" height="100" rx="16" fill="none"/>
+    <circle cx="240" cy="190" r="18" fill="#38bdf8"/>
+    <rect x="290" y="178" width="80" height="24" rx="6" fill="#38bdf8"/>
+    <rect x="180" y="270" width="440" height="100" rx="16" fill="none"/>
+    <circle cx="240" cy="320" r="18" fill="#34d399"/>
+    <rect x="290" y="308" width="120" height="24" rx="6" fill="#34d399"/>
+    <rect x="180" y="400" width="440" height="100" rx="16" fill="none"/>
+    <circle cx="240" cy="450" r="18" fill="#fbbf24"/>
+    <rect x="290" y="438" width="60" height="24" rx="6" fill="#fbbf24"/>
+    <rect x="180" y="530" width="440" height="100" rx="16" fill="none"/>
+    <circle cx="240" cy="580" r="18" fill="#f87171"/>
+    <rect x="290" y="568" width="100" height="24" rx="6" fill="#f87171"/>
+    <line x1="580" y1="190" x2="580" y2="630" stroke="#ffffff" stroke-width="16"/>
+  </g>
+</svg>

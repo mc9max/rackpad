@@ -1,0 +1,3852 @@
+import { StackMembersPanel } from "@/components/devices/StackMembersPanel";
+import { deviceTypeLineage } from "@/lib/device-types";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Link,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
+import { DeviceDrawer } from "@/components/shared/DeviceDrawer";
+import { CablingMapPanel } from "@/components/shared/CablingMapPanel";
+import { EmptyState } from "@/components/shared/EmptyState";
+import { TopBar } from "@/components/layout/TopBar";
+import { useI18n } from "@/i18n";
+import {
+  Card,
+  CardBody,
+  CardHeader,
+  CardHeading,
+  CardLabel,
+  CardTitle,
+} from "@/components/ui/Card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/Tabs";
+import { Button } from "@/components/ui/Button";
+import { Badge } from "@/components/ui/Badge";
+import { Input } from "@/components/ui/Input";
+import { StatusDot } from "@/components/shared/StatusDot";
+import { DeviceTypeIcon } from "@/components/shared/DeviceTypeIcon";
+import { Mono } from "@/components/shared/Mono";
+import { PortGrid } from "@/components/ports/PortGrid";
+import { PortList } from "@/components/ports/PortList";
+import { DevicePortEditor } from "@/components/ports/DevicePortEditor";
+import { StorageTopologyPanel } from "@/components/storage/StorageTopologyPanel";
+import { DeviceComputePanel } from "@/components/compute/DeviceComputePanel";
+import { DevicePhysicalLayoutPanel } from "@/components/rack/DevicePhysicalLayoutPanel";
+import { SnmpCredentialsPanel } from "@/components/shared/SnmpCredentialsPanel";
+import { SnmpSyncPanel } from "@/components/shared/SnmpSyncPanel";
+import { api } from "@/lib/api";
+import { buildSnmpVerifiedPortIdsForDevice } from "@/lib/snmp-port-status";
+import { selectComputeInventory } from "@/lib/compute";
+import {
+  canEditInventory,
+  createIpAssignmentRecord,
+  updateIpAssignmentRecord,
+  createDeviceImageRecord,
+  createDeviceMonitorConfig,
+  createDeviceServiceRecord,
+  createPortTemplateRecord,
+  deleteDevice,
+  deleteDeviceImageRecord,
+  deleteDeviceMonitorConfig,
+  deleteDeviceServiceRecord,
+  loadAll,
+  runDeviceMonitorCheck,
+  runDeviceMonitorChecksForDevice,
+  unassignIp,
+  updateDevice,
+  updateDeviceMonitorConfig,
+  updateDeviceServiceRecord,
+  upsertPhysicalLayoutRecord,
+  useStore,
+} from "@/lib/store";
+import type {
+  Device,
+  DeviceImage,
+  DocumentationDeviceLink,
+  DeviceMonitor,
+  DeviceService,
+  DeviceServiceType,
+  DiscoveredSnmpInterface,
+  IpAllocationMode,
+  IpAssignment,
+  IpAssignmentType,
+  Port,
+  PortLink,
+  SnmpCredential,
+  Subnet,
+  Vlan,
+} from "@/lib/types";
+import {
+  ArrowLeft,
+  AlertTriangle,
+  Download,
+  ExternalLink,
+  ImagePlus,
+  Pencil,
+  Plus,
+  RefreshCcw,
+  Save,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
+import {
+  cidrBounds,
+  formatPortLabel,
+  intToIp,
+  relativeTime,
+  statusLabel,
+} from "@/lib/utils";
+import { formatDeviceAddress } from "@/lib/network-labels";
+import {
+  deviceTypeBase,
+  deviceTypeMatchesTemplate,
+  localizedDeviceTypeIdLabel,
+} from "@/lib/device-types";
+import {
+  deriveOverviewStorage,
+  type OverviewStorageSource,
+} from "@/lib/storage";
+import {
+  defaultImageLabel,
+  imageSizeLimitLabel,
+  readImageFileAsDataUrl,
+} from "@/lib/image-data-url";
+import { downloadImageAsset, openImageAsset } from "@/lib/image-actions";
+
+type MonitorForm = {
+  name: string;
+  enabled: boolean;
+  type: DeviceMonitor["type"];
+  target: string;
+  port: string;
+  path: string;
+  ignoreTlsErrors: boolean;
+  snmpVersion: NonNullable<DeviceMonitor["snmpVersion"]>;
+  snmpCommunity: string;
+  clearSnmpCommunity: boolean;
+  snmpOid: string;
+  snmpExpectedValue: string;
+  snmpMatchMode: NonNullable<DeviceMonitor["snmpMatchMode"]>;
+  portId: string;
+  snmpIfIndex: string;
+  snmpCredentialId: string;
+  intervalMinutes: string;
+};
+
+const SNMP_MATCH_MODE_OPTIONS: Array<{
+  value: NonNullable<DeviceMonitor["snmpMatchMode"]>;
+  label: string;
+}> = [
+  { value: "any", label: "Any response" },
+  { value: "equals", label: "Equals" },
+  { value: "notEquals", label: "Not equals" },
+  { value: "in", label: "In list (comma-separated)" },
+  { value: "regex", label: "Regex (RE2)" },
+];
+
+const SNMP_OID_PRESETS = [
+  {
+    id: "custom",
+    label: "Custom OID",
+    oid: "",
+    expected: "",
+    matchMode: "equals" as const,
+  },
+  {
+    id: "sysUpTime",
+    label: "sysUpTime (uptime)",
+    oid: "1.3.6.1.2.1.1.3.0",
+    expected: "",
+    matchMode: "any" as const,
+  },
+  {
+    id: "ifOperStatus",
+    label: "ifOperStatus (link up)",
+    oid: "1.3.6.1.2.1.2.2.1.8",
+    expected: "1",
+    matchMode: "equals" as const,
+  },
+];
+
+const EMPTY_MONITOR_FORM: MonitorForm = {
+  name: "",
+  enabled: false,
+  type: "none",
+  target: "",
+  port: "",
+  path: "",
+  ignoreTlsErrors: false,
+  snmpVersion: "2c",
+  snmpCommunity: "public",
+  clearSnmpCommunity: false,
+  snmpOid: "",
+  snmpExpectedValue: "",
+  snmpMatchMode: "equals",
+  portId: "",
+  snmpIfIndex: "",
+  snmpCredentialId: "",
+  intervalMinutes: "5",
+};
+
+type NetworkIpForm = {
+  subnetId: string;
+  ipAddress: string;
+  assignmentType: IpAssignmentType;
+  allocationMode: IpAllocationMode;
+  dhcpScopeId: string;
+  portId: string;
+  description: string;
+};
+
+const EMPTY_NETWORK_IP_FORM: NetworkIpForm = {
+  subnetId: "",
+  ipAddress: "",
+  assignmentType: "interface",
+  allocationMode: "static",
+  dhcpScopeId: "",
+  portId: "",
+  description: "",
+};
+
+type ServiceForm = {
+  name: string;
+  serviceType: DeviceServiceType;
+  ipAssignmentId: string;
+  portId: string;
+  vlanId: string;
+  monitorId: string;
+  url: string;
+  notes: string;
+};
+
+const SERVICE_TYPES: DeviceServiceType[] = [
+  "dhcp",
+  "dns",
+  "vpn",
+  "ntp",
+  "snmp",
+  "syslog",
+  "http",
+  "https",
+  "database",
+  "app",
+  "custom",
+];
+
+const EMPTY_SERVICE_FORM: ServiceForm = {
+  name: "",
+  serviceType: "app",
+  ipAssignmentId: "",
+  portId: "",
+  vlanId: "",
+  monitorId: "",
+  url: "",
+  notes: "",
+};
+
+const NEW_MONITOR_ID = "__new_monitor__";
+const NEW_SERVICE_ID = "__new_service__";
+const DEVICE_DETAIL_TABS = new Set([
+  "overview",
+  "ports",
+  "physical",
+  "stack-members",
+  "storage",
+  "compute",
+  "network",
+  "monitoring",
+  "services",
+  "images",
+  "notes",
+  "activity",
+]);
+
+export default function DeviceDetail() {
+  const { t } = useI18n();
+  const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedTab = searchParams.get("tab") ?? "overview";
+  const currentUser = useStore((s) => s.currentUser);
+  const devices = useStore((s) => s.devices);
+  const ports = useStore((s) => s.ports);
+  const portLinks = useStore((s) => s.portLinks);
+  const physicalLayouts = useStore((s) => s.physicalLayouts);
+  const virtualSwitches = useStore((s) => s.virtualSwitches);
+  const vlans = useStore((s) => s.vlans);
+  const ipAssignments = useStore((s) => s.ipAssignments);
+  const subnets = useStore((s) => s.subnets);
+  const scopes = useStore((s) => s.scopes);
+  const auditLog = useStore((s) => s.auditLog);
+  const racks = useStore((s) => s.racks);
+  const deviceMonitors = useStore((s) => s.deviceMonitors);
+  const deviceImages = useStore((s) => s.deviceImages);
+  const deviceServices = useStore((s) => s.deviceServices);
+  const portTemplates = useStore((s) => s.portTemplates);
+  const deviceTypes = useStore((s) => s.deviceTypes);
+  const driveSlots = useStore((s) => s.driveSlots);
+  const storageDrives = useStore((s) => s.storageDrives);
+  const storagePools = useStore((s) => s.storagePools);
+  const documentationPages = useStore((s) => s.documentationPages);
+
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [releasingId, setReleasingId] = useState<string | null>(null);
+  const [editingAssignmentId, setEditingAssignmentId] = useState<string | null>(
+    null,
+  );
+  const [networkForm, setNetworkForm] = useState<NetworkIpForm>(
+    EMPTY_NETWORK_IP_FORM,
+  );
+  const [networkSaving, setNetworkSaving] = useState(false);
+  const [networkError, setNetworkError] = useState("");
+  const [selectedPortId, setSelectedPortId] = useState<string | undefined>();
+  const [creatingPort, setCreatingPort] = useState(false);
+  const [selectedPortTemplateId, setSelectedPortTemplateId] = useState("");
+  const [portTemplateApplying, setPortTemplateApplying] = useState(false);
+  const [portTemplateSaving, setPortTemplateSaving] = useState(false);
+  const [portToolbarError, setPortToolbarError] = useState("");
+  const [linkedDocumentation, setLinkedDocumentation] = useState<
+    DocumentationDeviceLink[]
+  >([]);
+  const [selectedMonitorId, setSelectedMonitorId] = useState<string | null>(
+    null,
+  );
+  const [monitorForm, setMonitorForm] =
+    useState<MonitorForm>(EMPTY_MONITOR_FORM);
+  const [monitorSaving, setMonitorSaving] = useState(false);
+  const [monitorRunning, setMonitorRunning] = useState(false);
+  const [allMonitorsRunning, setAllMonitorsRunning] = useState(false);
+  const [monitorDeleting, setMonitorDeleting] = useState(false);
+  const [monitorError, setMonitorError] = useState("");
+  const [snmpDiscoverLoading, setSnmpDiscoverLoading] = useState(false);
+  const [snmpImportLoading, setSnmpImportLoading] = useState(false);
+  const [snmpInterfaces, setSnmpInterfaces] = useState<
+    DiscoveredSnmpInterface[]
+  >([]);
+  const [snmpDiscoverError, setSnmpDiscoverError] = useState("");
+  const [snmpCredentials, setSnmpCredentials] = useState<SnmpCredential[]>([]);
+  const [selectedServiceId, setSelectedServiceId] = useState<string | null>(
+    null,
+  );
+  const [serviceForm, setServiceForm] =
+    useState<ServiceForm>(EMPTY_SERVICE_FORM);
+  const [serviceSaving, setServiceSaving] = useState(false);
+  const [serviceDeleting, setServiceDeleting] = useState(false);
+  const [serviceError, setServiceError] = useState("");
+  const [activityEntries, setActivityEntries] = useState<typeof auditLog>([]);
+  const [activityLimit, setActivityLimit] = useState(500);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityError, setActivityError] = useState("");
+  const [imageLabel, setImageLabel] = useState("");
+  const [imageNotes, setImageNotes] = useState("");
+  const [imageSaving, setImageSaving] = useState(false);
+  const [imageDeletingId, setImageDeletingId] = useState<string | null>(null);
+  const [imageError, setImageError] = useState("");
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
+
+  const device = id ? devices.find((entry) => entry.id === id) : undefined;
+  const physicalLayout = id
+    ? physicalLayouts.find((entry) => entry.deviceId === id)
+    : undefined;
+  const deviceDriveSlots = id
+    ? driveSlots.filter((entry) => entry.deviceId === id)
+    : [];
+  const deviceStoragePools = id
+    ? storagePools.filter((entry) => entry.deviceId === id)
+    : [];
+  const overviewStorage = device
+    ? deriveOverviewStorage(
+        device.id,
+        device.storageGb,
+        storageDrives,
+        storagePools,
+      )
+    : null;
+  const baseDeviceType = device
+    ? deviceTypeBase(device.deviceType, deviceTypes)
+    : null;
+  const isStack = !!device && deviceTypeLineage(device.deviceType, deviceTypes).includes("switch_stack");
+  const showStorage =
+    baseDeviceType === "server" ||
+    baseDeviceType === "storage" ||
+    deviceDriveSlots.length > 0 ||
+    deviceStoragePools.length > 0;
+  const computeInventory = useMemo(
+    () => selectComputeInventory(devices, deviceTypes),
+    [devices, deviceTypes],
+  );
+  const showCompute = Boolean(
+    device &&
+    (computeInventory.hosts.some((entry) => entry.id === device.id) ||
+      (computeInventory.guestsByHostId[device.id]?.length ?? 0) > 0 ||
+      virtualSwitches.some((entry) => entry.hostDeviceId === device.id)),
+  );
+  const selectedTab =
+    DEVICE_DETAIL_TABS.has(requestedTab) &&
+    (requestedTab !== "compute" || showCompute)
+      ? requestedTab
+      : "overview";
+  useEffect(() => {
+    if (!device) {
+      setLinkedDocumentation([]);
+      return;
+    }
+    void api
+      .getDocumentationLinks({ deviceId: device.id })
+      .then(setLinkedDocumentation)
+      .catch(() => setLinkedDocumentation([]));
+  }, [device]);
+
+  const linkedDocumentationPages = useMemo(
+    () =>
+      linkedDocumentation
+        .map((link) => ({
+          link,
+          page: documentationPages.find(
+            (page) => page.id === link.documentationPageId,
+          ),
+        }))
+        .filter((entry) => entry.page),
+    [documentationPages, linkedDocumentation],
+  );
+
+  const canEdit = canEditInventory(currentUser, device?.labId);
+  const canManageMonitoring = canEditInventory(currentUser, device?.labId);
+
+  useEffect(() => {
+    if (!device?.labId) {
+      setSnmpCredentials([]);
+      return;
+    }
+    void api
+      .getSnmpCredentials({ labId: device.labId })
+      .then(setSnmpCredentials)
+      .catch(() => setSnmpCredentials([]));
+  }, [device?.labId]);
+
+  const deviceMonitorList = useMemo(
+    () => (id ? deviceMonitors.filter((entry) => entry.deviceId === id) : []),
+    [deviceMonitors, id],
+  );
+  const snmpVerifiedPortIds = useMemo(
+    () =>
+      id
+        ? buildSnmpVerifiedPortIdsForDevice(deviceMonitors, id, ports)
+        : new Set<string>(),
+    [deviceMonitors, id, ports],
+  );
+  const deviceImageList = useMemo(
+    () => (id ? deviceImages.filter((entry) => entry.deviceId === id) : []),
+    [deviceImages, id],
+  );
+  const deviceServiceList = useMemo(
+    () =>
+      id
+        ? deviceServices
+            .filter((entry) => entry.deviceId === id)
+            .sort(
+              (a, b) =>
+                a.serviceType.localeCompare(b.serviceType) ||
+                a.name.localeCompare(b.name),
+            )
+        : [],
+    [deviceServices, id],
+  );
+  const selectedMonitor =
+    selectedMonitorId && selectedMonitorId !== NEW_MONITOR_ID
+      ? deviceMonitorList.find((entry) => entry.id === selectedMonitorId)
+      : undefined;
+  const selectedService =
+    selectedServiceId && selectedServiceId !== NEW_SERVICE_ID
+      ? deviceServiceList.find((entry) => entry.id === selectedServiceId)
+      : undefined;
+
+  const portsByDeviceId = useMemo(() => {
+    return ports.reduce<Record<string, Port[]>>((acc, port) => {
+      (acc[port.deviceId] ??= []).push(port);
+      return acc;
+    }, {});
+  }, [ports]);
+
+  const linkByPortId = useMemo(() => {
+    return portLinks.reduce<Record<string, PortLink>>((acc, link) => {
+      acc[link.fromPortId] = link;
+      acc[link.toPortId] = link;
+      return acc;
+    }, {});
+  }, [portLinks]);
+
+  const portById = useMemo(() => {
+    return ports.reduce<Record<string, Port>>((acc, port) => {
+      acc[port.id] = port;
+      return acc;
+    }, {});
+  }, [ports]);
+
+  const deviceById = useMemo(() => {
+    return devices.reduce<Record<string, Device>>((acc, entry) => {
+      acc[entry.id] = entry;
+      return acc;
+    }, {});
+  }, [devices]);
+  const vlanById = useMemo(() => {
+    return vlans.reduce<Record<string, Vlan>>((acc, entry) => {
+      acc[entry.id] = entry;
+      return acc;
+    }, {});
+  }, [vlans]);
+  const subnetById = useMemo(() => {
+    return subnets.reduce<Record<string, Subnet>>((acc, entry) => {
+      acc[entry.id] = entry;
+      return acc;
+    }, {});
+  }, [subnets]);
+  const networkAddressPlaceholder = useMemo(() => {
+    const subnet = subnetById[networkForm.subnetId];
+    if (!subnet) return t("IP address");
+    try {
+      const bounds = cidrBounds(subnet.cidr);
+      return intToIp(bounds.network + (bounds.size > 2 ? 1 : 0));
+    } catch {
+      return t("IP address");
+    }
+  }, [networkForm.subnetId, subnetById, t]);
+  const scopesForNetworkSubnet = useMemo(
+    () => scopes.filter((scope) => scope.subnetId === networkForm.subnetId),
+    [networkForm.subnetId, scopes],
+  );
+  const virtualSwitchById = useMemo(() => {
+    return virtualSwitches.reduce<
+      Record<string, (typeof virtualSwitches)[number]>
+    >((acc, entry) => {
+      acc[entry.id] = entry;
+      return acc;
+    }, {});
+  }, [virtualSwitches]);
+
+  useEffect(() => {
+    setSelectedMonitorId(null);
+    setImageLabel("");
+    setImageNotes("");
+    setImageError("");
+    setNetworkForm({
+      ...EMPTY_NETWORK_IP_FORM,
+      subnetId: subnets[0]?.id ?? "",
+    });
+    setNetworkError("");
+    setSelectedServiceId(null);
+    setServiceForm(EMPTY_SERVICE_FORM);
+    setServiceError("");
+  }, [device?.id, subnets]);
+
+  useEffect(() => {
+    if (!subnets.length) return;
+    setNetworkForm((prev) =>
+      prev.subnetId && subnets.some((entry) => entry.id === prev.subnetId)
+        ? prev
+        : { ...prev, subnetId: subnets[0].id },
+    );
+  }, [subnets]);
+
+  useEffect(() => {
+    if (networkForm.allocationMode !== "dhcp-reservation") return;
+    if (
+      networkForm.dhcpScopeId &&
+      scopesForNetworkSubnet.some(
+        (scope) => scope.id === networkForm.dhcpScopeId,
+      )
+    ) {
+      return;
+    }
+    setNetworkForm((prev) => ({
+      ...prev,
+      dhcpScopeId: scopesForNetworkSubnet[0]?.id ?? "",
+    }));
+  }, [
+    networkForm.allocationMode,
+    networkForm.dhcpScopeId,
+    scopesForNetworkSubnet,
+  ]);
+
+  useEffect(() => {
+    if (!device) return;
+    if (deviceMonitorList.length === 0) {
+      if (selectedMonitorId !== NEW_MONITOR_ID) {
+        setSelectedMonitorId(NEW_MONITOR_ID);
+      }
+      return;
+    }
+    if (
+      !selectedMonitorId ||
+      (selectedMonitorId !== NEW_MONITOR_ID &&
+        !deviceMonitorList.some((entry) => entry.id === selectedMonitorId))
+    ) {
+      setSelectedMonitorId(deviceMonitorList[0].id);
+    }
+  }, [device, deviceMonitorList, selectedMonitorId]);
+
+  useEffect(() => {
+    if (!device) return;
+
+    if (selectedMonitor) {
+      setMonitorForm(monitorToForm(selectedMonitor, device));
+    } else {
+      setMonitorForm(buildNewMonitorForm(device, deviceMonitorList.length));
+    }
+    setMonitorError("");
+  }, [device, selectedMonitor, deviceMonitorList.length]);
+
+  useEffect(() => {
+    if (!device) return;
+    if (deviceServiceList.length === 0) {
+      if (selectedServiceId !== NEW_SERVICE_ID) {
+        setSelectedServiceId(NEW_SERVICE_ID);
+      }
+      return;
+    }
+    if (
+      !selectedServiceId ||
+      (selectedServiceId !== NEW_SERVICE_ID &&
+        !deviceServiceList.some((entry) => entry.id === selectedServiceId))
+    ) {
+      setSelectedServiceId(deviceServiceList[0].id);
+    }
+  }, [device, deviceServiceList, selectedServiceId]);
+
+  useEffect(() => {
+    if (selectedService) {
+      setServiceForm(serviceToForm(selectedService));
+    } else {
+      setServiceForm(EMPTY_SERVICE_FORM);
+    }
+    setServiceError("");
+  }, [selectedService]);
+
+  const devicePorts = useMemo(
+    () => (device?.id ? (portsByDeviceId[device.id] ?? []) : []),
+    [device?.id, portsByDeviceId],
+  );
+  const networkAssignablePorts = devicePorts.filter(
+    (port) => port.kind !== "power",
+  );
+  const rack = device?.rackId
+    ? racks.find((entry) => entry.id === device.rackId)
+    : undefined;
+  const deviceIps = device?.id
+    ? ipAssignments.filter((assignment) => assignment.deviceId === device.id)
+    : [];
+  const hostSharedAssignment =
+    device?.managementIp && device.parentDeviceId
+      ? ipAssignments.find(
+          (assignment) =>
+            assignment.deviceId === device.parentDeviceId &&
+            assignment.ipAddress === device.managementIp,
+        )
+      : undefined;
+  const displayedDeviceIpCount =
+    deviceIps.length + (hostSharedAssignment ? 1 : 0);
+  const parentDevice = device?.parentDeviceId
+    ? deviceById[device.parentDeviceId]
+    : undefined;
+  const childDevices = useMemo(
+    () =>
+      device
+        ? devices.filter((entry) => entry.parentDeviceId === device.id)
+        : [],
+    [device, devices],
+  );
+  const childCapacity = useMemo(
+    () => ({
+      cpu: childDevices.reduce((sum, entry) => sum + (entry.cpuCores ?? 0), 0),
+      memory: childDevices.reduce(
+        (sum, entry) => sum + (entry.memoryGb ?? 0),
+        0,
+      ),
+      storage: childDevices.reduce(
+        (sum, entry) => sum + (entry.storageGb ?? 0),
+        0,
+      ),
+    }),
+    [childDevices],
+  );
+  const selectedPort = selectedPortId
+    ? devicePorts.find((port) => port.id === selectedPortId)
+    : undefined;
+  const selectedLink = selectedPort ? linkByPortId[selectedPort.id] : undefined;
+  const peerPortId =
+    selectedPort && selectedLink
+      ? selectedLink.fromPortId === selectedPort.id
+        ? selectedLink.toPortId
+        : selectedLink.fromPortId
+      : undefined;
+  const peerPort = peerPortId ? portById[peerPortId] : undefined;
+  const peerDevice = peerPort ? deviceById[peerPort.deviceId] : undefined;
+  const linkedCount = devicePorts.filter(
+    (port) => port.linkState === "up",
+  ).length;
+  const isVisualGrid =
+    baseDeviceType === "switch" || baseDeviceType === "router";
+  const compatiblePortTemplates = useMemo(
+    () =>
+      device
+        ? portTemplates.filter((template) =>
+            deviceTypeMatchesTemplate(
+              device.deviceType,
+              template.deviceTypes,
+              deviceTypes,
+            ),
+          )
+        : [],
+    [device, deviceTypes, portTemplates],
+  );
+  const hardwareMeta = [device?.manufacturer, device?.model]
+    .filter(Boolean)
+    .join(" ");
+
+  useEffect(() => {
+    if (!devicePorts.length) {
+      if (!creatingPort) setSelectedPortId(undefined);
+      return;
+    }
+    if (
+      !creatingPort &&
+      (!selectedPortId ||
+        !devicePorts.some((port) => port.id === selectedPortId))
+    ) {
+      setSelectedPortId(devicePorts[0].id);
+    }
+  }, [creatingPort, devicePorts, selectedPortId]);
+
+  useEffect(() => {
+    if (!device || compatiblePortTemplates.length === 0) {
+      setSelectedPortTemplateId("");
+      return;
+    }
+    if (
+      !selectedPortTemplateId ||
+      !compatiblePortTemplates.some(
+        (template) => template.id === selectedPortTemplateId,
+      )
+    ) {
+      setSelectedPortTemplateId(compatiblePortTemplates[0]?.id ?? "");
+    }
+  }, [compatiblePortTemplates, device, selectedPortTemplateId]);
+
+  async function applyPortTemplate() {
+    if (!device || !selectedPortTemplateId || devicePorts.length > 0) return;
+    setPortTemplateApplying(true);
+    setPortToolbarError("");
+    try {
+      await updateDevice(device.id, { portTemplateId: selectedPortTemplateId });
+      setCreatingPort(false);
+    } catch (err) {
+      setPortToolbarError(
+        err instanceof Error ? err.message : "Failed to apply port template.",
+      );
+    } finally {
+      setPortTemplateApplying(false);
+    }
+  }
+
+  async function savePortsAsTemplate() {
+    if (!device || devicePorts.length === 0) return;
+    const name = window.prompt(
+      t("Template name"),
+      t("{hostname} template", { hostname: device.hostname }),
+    );
+    if (!name?.trim()) return;
+    const description =
+      window.prompt(
+        t("Template description"),
+        t("{hostname} port layout", { hostname: device.hostname }),
+      ) ?? "";
+    if (!description.trim()) {
+      setPortToolbarError(t("Template description is required."));
+      return;
+    }
+
+    setPortTemplateSaving(true);
+    setPortToolbarError("");
+    try {
+      await createPortTemplateRecord({
+        name: name.trim(),
+        description: description.trim(),
+        deviceTypes: [device.deviceType],
+        ports: devicePorts.map((port, index) => ({
+          name: port.name,
+          position: port.position ?? index + 1,
+          kind: port.kind,
+          speed: port.speed,
+          mode: port.mode ?? "access",
+          allowedVlanIds:
+            port.mode === "trunk" ? port.allowedVlanIds : undefined,
+          face: port.face ?? "front",
+        })),
+      });
+    } catch (err) {
+      setPortToolbarError(
+        err instanceof Error ? err.message : t("Failed to save port template."),
+      );
+    } finally {
+      setPortTemplateSaving(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!device) {
+      setActivityEntries([]);
+      return;
+    }
+    const filtered = auditLog.filter((entry) => entry.entityId === device.id);
+    setActivityEntries(filtered);
+    setActivityLimit(Math.max(500, filtered.length || 0));
+    setActivityError("");
+  }, [auditLog, device]);
+
+  if (!device) {
+    return (
+      <>
+        <TopBar subtitle={t("Devices")} title={t("Not found")} />
+        <div className="flex flex-1 items-center justify-center">
+          <div className="text-center">
+            <div className="mb-3 text-sm text-[var(--color-fg-subtle)]">
+              {t("Device not found.")}
+            </div>
+            <Button variant="outline" size="sm" asChild>
+              <Link to="/devices">
+                <ArrowLeft />
+                {t("Back to devices")}
+              </Link>
+            </Button>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  async function handleRefresh() {
+    setRefreshing(true);
+    try {
+      await loadAll(true);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  async function handleDelete() {
+    if (!device) return;
+    if (
+      !window.confirm(
+        t(
+          "Delete {hostname}? This will remove its ports and IP assignments too.",
+          { hostname: device.hostname },
+        ),
+      )
+    ) {
+      return;
+    }
+
+    setDeleting(true);
+    try {
+      const deleted = await deleteDevice(device.id);
+      if (deleted) {
+        navigate("/devices");
+      }
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  async function handleUnassignIp(assignmentId: string) {
+    setReleasingId(assignmentId);
+    try {
+      await unassignIp(assignmentId);
+    } finally {
+      setReleasingId(null);
+    }
+  }
+
+  function setNetworkField<K extends keyof NetworkIpForm>(
+    key: K,
+    value: NetworkIpForm[K],
+  ) {
+    setNetworkForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function startEditingAssignment(assignment: IpAssignment) {
+    setEditingAssignmentId(assignment.id);
+    setNetworkError("");
+    setNetworkForm({
+      subnetId: assignment.subnetId,
+      ipAddress: assignment.ipAddress,
+      assignmentType: assignment.assignmentType,
+      allocationMode: assignment.allocationMode ?? "static",
+      dhcpScopeId: assignment.dhcpScopeId ?? "",
+      portId: assignment.portId ?? "",
+      description: assignment.description ?? "",
+    });
+  }
+
+  function cancelEditingAssignment() {
+    setEditingAssignmentId(null);
+    setNetworkError("");
+    setNetworkForm(EMPTY_NETWORK_IP_FORM);
+  }
+
+  async function handleSaveIpAssignment() {
+    if (!device || !canEdit) return;
+    setNetworkError("");
+
+    const ipAddress = networkForm.ipAddress.trim();
+    const subnetId = networkForm.subnetId.trim();
+    if (!subnetId) {
+      setNetworkError("Select the subnet for this address.");
+      return;
+    }
+    if (!ipAddress) {
+      setNetworkError("IP address is required.");
+      return;
+    }
+
+    setNetworkSaving(true);
+    try {
+      const payload = {
+        subnetId,
+        ipAddress,
+        assignmentType: networkForm.assignmentType,
+        allocationMode: networkForm.allocationMode,
+        dhcpScopeId:
+          networkForm.allocationMode === "dhcp-reservation"
+            ? networkForm.dhcpScopeId || undefined
+            : undefined,
+        deviceId: device.id,
+        portId: networkForm.portId || undefined,
+        hostname: device.hostname,
+        description:
+          networkForm.description.trim() ||
+          (networkForm.portId
+            ? `Interface ${portById[networkForm.portId]?.name ?? ""}`.trim()
+            : "Device address"),
+      };
+
+      if (editingAssignmentId) {
+        await updateIpAssignmentRecord(editingAssignmentId, payload);
+        cancelEditingAssignment();
+      } else {
+        await createIpAssignmentRecord(payload);
+        setNetworkForm((prev) => ({
+          ...EMPTY_NETWORK_IP_FORM,
+          subnetId: prev.subnetId,
+          assignmentType: prev.assignmentType,
+          allocationMode: prev.allocationMode,
+          dhcpScopeId: prev.dhcpScopeId,
+        }));
+      }
+    } catch (err) {
+      setNetworkError(
+        err instanceof Error ? err.message : "Failed to save IP address.",
+      );
+    } finally {
+      setNetworkSaving(false);
+    }
+  }
+
+  async function handleImageSelected(file: File | undefined) {
+    if (!file || !device || !canEdit) return;
+    setImageSaving(true);
+    setImageError("");
+    try {
+      const dataUrl = await readImageFileAsDataUrl(file);
+      await createDeviceImageRecord({
+        deviceId: device.id,
+        label: imageLabel.trim() || defaultImageLabel(file.name),
+        fileName: file.name,
+        mimeType: file.type,
+        dataUrl,
+        notes: imageNotes.trim() || null,
+      });
+      setImageLabel("");
+      setImageNotes("");
+    } catch (err) {
+      setImageError(
+        err instanceof Error ? err.message : "Failed to add image.",
+      );
+    } finally {
+      setImageSaving(false);
+      if (imageInputRef.current) imageInputRef.current.value = "";
+    }
+  }
+
+  async function handleDeleteImage(image: DeviceImage) {
+    if (!window.confirm(t("Delete image {label}?", { label: image.label })))
+      return;
+    setImageDeletingId(image.id);
+    setImageError("");
+    try {
+      await deleteDeviceImageRecord(image.id);
+    } catch (err) {
+      setImageError(
+        err instanceof Error ? err.message : "Failed to delete image.",
+      );
+    } finally {
+      setImageDeletingId(null);
+    }
+  }
+
+  function handleOpenImage(image: DeviceImage) {
+    openImageAsset(image);
+  }
+
+  function handleDownloadImage(image: DeviceImage) {
+    downloadImageAsset(image);
+  }
+
+  function snmpDiscoveryPayload() {
+    if (!device) return null;
+    return {
+      deviceId: device.id,
+      target: monitorForm.target.trim() || device.managementIp || undefined,
+      port: monitorForm.port.trim()
+        ? Number.parseInt(monitorForm.port, 10)
+        : undefined,
+      snmpCredentialId: monitorForm.snmpCredentialId.trim() || undefined,
+      snmpVersion: monitorForm.snmpCredentialId.trim()
+        ? undefined
+        : monitorForm.snmpVersion,
+      monitorId: selectedMonitor?.id,
+      snmpCommunity: monitorForm.snmpCredentialId.trim()
+        ? undefined
+        : monitorForm.clearSnmpCommunity ? "" : monitorForm.snmpCommunity.trim() || undefined,
+    };
+  }
+
+  async function handleDiscoverSnmpInterfaces() {
+    if (!device) return;
+    const payload = snmpDiscoveryPayload();
+    if (!payload?.target) {
+      setSnmpDiscoverError("Set a management IP or SNMP target first.");
+      return;
+    }
+
+    setSnmpDiscoverLoading(true);
+    setSnmpDiscoverError("");
+    try {
+      const result = await api.discoverSnmpInterfaces(payload);
+      setSnmpInterfaces(result.interfaces);
+    } catch (error) {
+      setSnmpDiscoverError(
+        error instanceof Error ? error.message : "SNMP discovery failed.",
+      );
+      setSnmpInterfaces([]);
+    } finally {
+      setSnmpDiscoverLoading(false);
+    }
+  }
+
+  async function handleImportSnmpInterfaces(ifIndexes?: number[]) {
+    if (!device) return;
+    const payload = snmpDiscoveryPayload();
+    if (!payload?.target) {
+      setSnmpDiscoverError("Set a management IP or SNMP target first.");
+      return;
+    }
+
+    setSnmpImportLoading(true);
+    setSnmpDiscoverError("");
+    try {
+      const result = await api.importSnmpInterfaceMonitors({
+        ...payload,
+        ifIndexes,
+        skipExisting: true,
+        intervalMs:
+          Math.max(1, Number.parseInt(monitorForm.intervalMinutes, 10) || 5) *
+          60 *
+          1000,
+        expectedOperStatus: "1",
+      });
+      await loadAll(true);
+      if (result.created[0]) {
+        setSelectedMonitorId(result.created[0].id);
+      }
+      setSnmpInterfaces([]);
+    } catch (error) {
+      setSnmpDiscoverError(
+        error instanceof Error
+          ? error.message
+          : "Failed to import SNMP monitors.",
+      );
+    } finally {
+      setSnmpImportLoading(false);
+    }
+  }
+
+  async function handleSaveMonitor() {
+    if (!device) return;
+    setMonitorSaving(true);
+    setMonitorError("");
+    try {
+      const usesPort =
+        monitorForm.type === "tcp" ||
+        monitorForm.type === "http" ||
+        monitorForm.type === "https" ||
+        monitorForm.type === "snmp";
+      const usesPath =
+        monitorForm.type === "http" || monitorForm.type === "https";
+      const usesSnmp = monitorForm.type === "snmp";
+      const payload = {
+        name: monitorForm.name.trim() || null,
+        enabled: monitorForm.enabled,
+        type: monitorForm.type,
+        target: monitorForm.target.trim() || null,
+        port:
+          usesPort && monitorForm.port.trim()
+            ? Number.parseInt(monitorForm.port, 10)
+            : null,
+        path: usesPath ? monitorForm.path.trim() || null : null,
+        ignoreTlsErrors:
+          monitorForm.type === "https" && monitorForm.ignoreTlsErrors,
+        snmpVersion: usesSnmp ? monitorForm.snmpVersion : null,
+        snmpCommunity: usesSnmp
+          ? monitorForm.clearSnmpCommunity ? null : monitorForm.snmpCommunity.trim() || undefined
+          : null,
+        snmpOid: usesSnmp ? monitorForm.snmpOid.trim() || null : null,
+        snmpExpectedValue: usesSnmp
+          ? monitorForm.snmpExpectedValue.trim() || null
+          : null,
+        snmpMatchMode: usesSnmp ? monitorForm.snmpMatchMode : null,
+        portId: usesSnmp ? monitorForm.portId.trim() || null : null,
+        snmpIfIndex:
+          usesSnmp && monitorForm.snmpIfIndex.trim()
+            ? Number.parseInt(monitorForm.snmpIfIndex, 10)
+            : null,
+        snmpCredentialId: usesSnmp
+          ? monitorForm.snmpCredentialId.trim() || null
+          : null,
+        intervalMs:
+          Math.max(1, Number.parseInt(monitorForm.intervalMinutes, 10) || 5) *
+          60 *
+          1000,
+      };
+
+      if (selectedMonitor) {
+        const updated = await updateDeviceMonitorConfig(
+          selectedMonitor.id,
+          payload,
+        );
+        if (updated && monitorForm.enabled && monitorForm.type !== "none") {
+          await runDeviceMonitorCheck(updated.id);
+        }
+        return;
+      }
+
+      const created = await createDeviceMonitorConfig(device.id, payload);
+      setSelectedMonitorId(created.id);
+      if (monitorForm.enabled && monitorForm.type !== "none") {
+        await runDeviceMonitorCheck(created.id);
+      }
+    } catch (err) {
+      setMonitorError(
+        err instanceof Error ? err.message : "Failed to save monitor.",
+      );
+    } finally {
+      setMonitorSaving(false);
+    }
+  }
+
+  async function handleRunMonitor() {
+    if (!selectedMonitor) return;
+    setMonitorRunning(true);
+    setMonitorError("");
+    try {
+      await runDeviceMonitorCheck(selectedMonitor.id);
+    } catch (err) {
+      setMonitorError(
+        err instanceof Error ? err.message : "Failed to run monitor.",
+      );
+    } finally {
+      setMonitorRunning(false);
+    }
+  }
+
+  async function handleRunAllMonitors() {
+    if (!device) return;
+    setAllMonitorsRunning(true);
+    setMonitorError("");
+    try {
+      await runDeviceMonitorChecksForDevice(device.id);
+    } catch (err) {
+      setMonitorError(
+        err instanceof Error ? err.message : "Failed to run device monitors.",
+      );
+    } finally {
+      setAllMonitorsRunning(false);
+    }
+  }
+
+  async function handleDeleteMonitor() {
+    if (!selectedMonitor) return;
+    if (
+      !window.confirm(
+        t('Delete monitor target "{name}"?', { name: selectedMonitor.name }),
+      )
+    ) {
+      return;
+    }
+
+    setMonitorDeleting(true);
+    setMonitorError("");
+    try {
+      const deleted = await deleteDeviceMonitorConfig(selectedMonitor.id);
+      if (deleted) {
+        setSelectedMonitorId(
+          deviceMonitorList.length > 1 ? null : NEW_MONITOR_ID,
+        );
+      }
+    } catch (err) {
+      setMonitorError(
+        err instanceof Error ? err.message : "Failed to delete monitor.",
+      );
+    } finally {
+      setMonitorDeleting(false);
+    }
+  }
+
+  function startNewMonitor() {
+    if (!device) return;
+    setSelectedMonitorId(NEW_MONITOR_ID);
+    setMonitorForm(buildNewMonitorForm(device, deviceMonitorList.length));
+    setMonitorError("");
+  }
+
+  function setServiceField<K extends keyof ServiceForm>(
+    key: K,
+    value: ServiceForm[K],
+  ) {
+    setServiceForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function startNewService() {
+    setSelectedServiceId(NEW_SERVICE_ID);
+    setServiceForm(EMPTY_SERVICE_FORM);
+    setServiceError("");
+  }
+
+  async function handleSaveService() {
+    if (!device || !canManageMonitoring) return;
+    const name = serviceForm.name.trim();
+    if (!name) {
+      setServiceError("Service name is required.");
+      return;
+    }
+
+    setServiceSaving(true);
+    setServiceError("");
+    const payload = {
+      deviceId: device.id,
+      name,
+      serviceType: serviceForm.serviceType,
+      ipAssignmentId: serviceForm.ipAssignmentId || null,
+      portId: serviceForm.portId || null,
+      vlanId: serviceForm.vlanId || null,
+      monitorId: serviceForm.monitorId || null,
+      url: serviceForm.url.trim() || null,
+      notes: serviceForm.notes.trim() || null,
+    };
+
+    try {
+      if (selectedService) {
+        await updateDeviceServiceRecord(selectedService.id, payload);
+      } else {
+        const created = await createDeviceServiceRecord(payload);
+        setSelectedServiceId(created.id);
+      }
+    } catch (err) {
+      setServiceError(
+        err instanceof Error ? err.message : "Failed to save service.",
+      );
+    } finally {
+      setServiceSaving(false);
+    }
+  }
+
+  async function handleDeleteService() {
+    if (!selectedService) return;
+    if (
+      !window.confirm(
+        t('Delete service "{name}"?', { name: selectedService.name }),
+      )
+    )
+      return;
+    setServiceDeleting(true);
+    setServiceError("");
+    try {
+      await deleteDeviceServiceRecord(selectedService.id);
+      setSelectedServiceId(
+        deviceServiceList.length > 1 ? null : NEW_SERVICE_ID,
+      );
+    } catch (err) {
+      setServiceError(
+        err instanceof Error ? err.message : "Failed to delete service.",
+      );
+    } finally {
+      setServiceDeleting(false);
+    }
+  }
+
+  async function handleLoadMoreActivity() {
+    if (!device) return;
+    const nextLimit = activityLimit + 250;
+    setActivityLoading(true);
+    setActivityError("");
+    try {
+      const entries = await api.getAuditLog({
+        entityId: device.id,
+        limit: nextLimit,
+      });
+      setActivityEntries(entries);
+      setActivityLimit(nextLimit);
+    } catch (err) {
+      setActivityError(
+        err instanceof Error
+          ? err.message
+          : "Failed to load additional audit entries.",
+      );
+    } finally {
+      setActivityLoading(false);
+    }
+  }
+
+  const showMonitorPortField =
+    monitorForm.type === "tcp" ||
+    monitorForm.type === "http" ||
+    monitorForm.type === "https" ||
+    monitorForm.type === "snmp";
+  const showMonitorPathField =
+    monitorForm.type === "http" || monitorForm.type === "https";
+  const showMonitorSnmpFields = monitorForm.type === "snmp";
+  const monitorTypeDescription = describeMonitorType(monitorForm.type, t);
+  const monitorStateTone =
+    device.status === "online"
+      ? "ok"
+      : device.status === "offline"
+        ? "err"
+        : "neutral";
+  const activeMonitorCount = deviceMonitorList.filter(
+    (entry) => entry.enabled && entry.type !== "none",
+  ).length;
+
+  return (
+    <>
+      <TopBar
+        subtitle={
+          rack ? (
+            <>
+              {t("Devices")} |{" "}
+              <Link
+                to={`/racks?rackId=${rack.id}`}
+                className="hover:text-[var(--color-fg-muted)]"
+              >
+                {rack.name}
+              </Link>
+            </>
+          ) : (
+            t("Devices")
+          )
+        }
+        title={device.hostname}
+        meta={
+          <>
+            <span className="inline-flex items-center gap-1.5">
+              <StatusDot status={device.status} />
+              <span className="font-mono text-[10px] uppercase tracking-wider text-[var(--color-fg-muted)]">
+                {statusLabel[device.status]}
+              </span>
+            </span>
+            {hardwareMeta && (
+              <span className="font-mono text-[10px] uppercase tracking-wider text-[var(--color-fg-subtle)]">
+                | {hardwareMeta}
+              </span>
+            )}
+            {physicalLayout?.effectiveStatus !== "accurate" && (
+              <Link
+                to={`/devices/${device.id}?tab=physical`}
+                className="inline-flex items-center gap-1 font-mono text-[10px] uppercase tracking-wider text-[var(--color-warning)] hover:underline"
+              >
+                <AlertTriangle className="size-3" />
+                {t("Physical layout")} · {t("Needs attention")}
+              </Link>
+            )}
+          </>
+        }
+        actions={
+          <>
+            {canEdit && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setDrawerOpen(true)}
+              >
+                <Pencil className="size-3.5" />
+                {t("Edit")}
+              </Button>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void handleRefresh()}
+              disabled={refreshing}
+            >
+              <RefreshCcw className="size-3.5" />
+              {refreshing ? t("Refreshing...") : t("Refresh")}
+            </Button>
+            {canEdit && (
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={() => void handleDelete()}
+                disabled={deleting}
+              >
+                <Trash2 className="size-3.5" />
+                {deleting ? t("Deleting...") : t("Delete")}
+              </Button>
+            )}
+          </>
+        }
+      />
+
+      <input
+        ref={imageInputRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif"
+        className="hidden"
+        onChange={(event) => void handleImageSelected(event.target.files?.[0])}
+      />
+
+      <div className="flex-1 overflow-y-auto px-6 py-5">
+        <div className="mb-4 flex items-center gap-2">
+          <Button variant="ghost" size="sm" asChild>
+            <Link to="/devices">
+              <ArrowLeft className="size-3.5" />
+              {t("Devices")}
+            </Link>
+          </Button>
+        </div>
+
+        <Card className="relative mb-4 overflow-hidden">
+          <span className="absolute left-0 top-0 h-px w-full bg-gradient-to-r from-transparent via-[var(--color-accent)] to-transparent opacity-60" />
+          <div className="flex flex-col items-stretch gap-4 px-4 py-4 lg:flex-row lg:items-center lg:gap-5 lg:px-5">
+            <div className="flex min-w-0 items-center gap-4 lg:flex-1">
+              <div className="grid size-12 shrink-0 place-items-center rounded-[var(--radius-sm)] border border-[var(--color-line-strong)] bg-[var(--color-surface)]">
+                <DeviceTypeIcon
+                  type={device.deviceType}
+                  className="size-5 text-[var(--color-accent)]"
+                />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-fg-subtle)]">
+                  {localizedDeviceTypeIdLabel(
+                    device.deviceType,
+                    deviceTypes,
+                    t,
+                  )}
+                </div>
+                <h1 className="break-words text-xl font-semibold tracking-tight">
+                  {device.hostname}
+                </h1>
+                <div className="mt-0.5 break-words text-xs text-[var(--color-fg-subtle)]">
+                  {device.displayName}
+                  {rack && (
+                    <>
+                      <span className="mx-1.5 text-[var(--color-fg-faint)]">
+                        |
+                      </span>
+                      {device.placement === "shelf" && parentDevice
+                        ? t("{name} | shelf {hostname}", {
+                            name: rack.name,
+                            hostname: parentDevice.hostname,
+                          })
+                        : t("{name} {value2}", {
+                            name: rack.name,
+                            value2: formatRackUnit(device, t),
+                          })}
+                    </>
+                  )}
+                </div>
+                {device.placement === "virtual" && device.parentDeviceId && (
+                  <div
+                    className="mt-1 text-xs text-[var(--color-fg-subtle)]"
+                    data-testid="device-host-relationship"
+                  >
+                    {t("Hosted by")}{" "}
+                    {parentDevice ? (
+                      <Link
+                        className="font-medium text-[var(--color-accent)] hover:underline"
+                        to={`/devices/${parentDevice.id}`}
+                      >
+                        {parentDevice.hostname}
+                      </Link>
+                    ) : (
+                      <span className="font-medium text-[var(--color-warning)]">
+                        {t("Host unavailable")}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+            <dl className="grid w-full grid-cols-2 gap-x-5 gap-y-2 text-[11px] sm:grid-cols-3 lg:w-auto lg:gap-x-6 lg:gap-y-1">
+              <Stat
+                label={t("Mgmt IP / MAC")}
+                value={formatDeviceAddress(device)}
+                mono
+              />
+              <Stat label={t("Serial")} value={device.serial} mono />
+              <Stat
+                label={t("Last seen")}
+                value={relativeTime(device.lastSeen)}
+              />
+              <Stat
+                label={t("Ports")}
+                value={`${linkedCount}/${devicePorts.length} linked`}
+              />
+              <Stat label={t("IPs")} value={String(displayedDeviceIpCount)} />
+              <Stat label={t("Tags")} value={device.tags?.join(", ") ?? "-"} />
+            </dl>
+          </div>
+        </Card>
+
+        <Tabs
+          value={selectedTab}
+          onValueChange={(nextTab) => {
+            const nextParams = new URLSearchParams(searchParams);
+            if (nextTab === "overview") {
+              nextParams.delete("tab");
+            } else {
+              nextParams.set("tab", nextTab);
+            }
+            setSearchParams(nextParams, { replace: true });
+          }}
+        >
+          <TabsList className="max-w-full overflow-x-auto [&>*]:shrink-0 [&>*]:whitespace-nowrap">
+            <TabsTrigger value="overview">{t("Overview")}</TabsTrigger>
+            <TabsTrigger value="ports">
+              {t("Ports")} | {devicePorts.length}
+            </TabsTrigger>
+            <TabsTrigger value="physical">{t("Physical layout")}</TabsTrigger>
+            {isStack && <TabsTrigger value="stack-members">{t("Stack Members")}</TabsTrigger>}
+            {showStorage && (
+              <TabsTrigger value="storage">
+                {t("Storage")} | {deviceDriveSlots.length}
+              </TabsTrigger>
+            )}
+            {showCompute && (
+              <TabsTrigger value="compute">
+                {t("Compute")} |{" "}
+                {(computeInventory.guestsByHostId[device.id] ?? []).length}
+              </TabsTrigger>
+            )}
+            <TabsTrigger value="network">
+              {t("Network")} | {displayedDeviceIpCount}
+            </TabsTrigger>
+            <TabsTrigger value="monitoring">{t("Monitoring")}</TabsTrigger>
+            <TabsTrigger value="services">
+              {t("Services |")}
+              {deviceServiceList.length}
+            </TabsTrigger>
+            <TabsTrigger value="images">
+              {t("Images |")}
+              {deviceImageList.length}
+            </TabsTrigger>
+            <TabsTrigger value="notes">{t("Notes")}</TabsTrigger>
+            <TabsTrigger value="activity">{t("Activity")}</TabsTrigger>
+          </TabsList>
+
+          {isStack && <TabsContent value="stack-members" className="pt-4"><StackMembersPanel device={device} ports={devicePorts} canEdit={canEdit} /></TabsContent>}
+          <TabsContent value="overview" className="pt-4">
+            <div className="grid grid-cols-12 gap-3">
+              <Card className="col-span-12 md:col-span-6">
+                <CardHeader>
+                  <CardTitle>
+                    <CardLabel>{t("Hardware")}</CardLabel>
+                    <CardHeading>{t("Specifications")}</CardHeading>
+                  </CardTitle>
+                </CardHeader>
+                <CardBody>
+                  <dl className="space-y-2 text-xs">
+                    <Row
+                      label={t("Manufacturer")}
+                      value={device.manufacturer}
+                    />
+                    <Row label={t("Model")} value={device.model} mono />
+                    <Row label={t("Serial")} value={device.serial} mono />
+                    <Row
+                      label={t("Type")}
+                      value={localizedDeviceTypeIdLabel(
+                        device.deviceType,
+                        deviceTypes,
+                        t,
+                      )}
+                    />
+                    <Row
+                      label={t("CPU cores")}
+                      value={formatCapacityValue(device.cpuCores)}
+                      mono
+                    />
+                    <Row
+                      label={t("Memory")}
+                      value={formatCapacityUnit(device.memoryGb, "GB")}
+                      mono
+                    />
+                    <Row
+                      label={t("Storage")}
+                      value={
+                        overviewStorage?.capacityGb == null ? undefined : (
+                          <span className="inline-flex flex-wrap items-center justify-end gap-x-2 gap-y-0.5">
+                            <span>
+                              {formatCapacityUnit(
+                                overviewStorage.capacityGb,
+                                "GB",
+                              )}
+                            </span>
+                            <span
+                              data-testid="device-overview-storage-source"
+                              className="text-[10px] font-normal text-[var(--color-fg-subtle)]"
+                            >
+                              {t(
+                                overviewStorageSourceLabel(
+                                  overviewStorage.source,
+                                ),
+                              )}
+                            </span>
+                          </span>
+                        )
+                      }
+                      mono
+                    />
+                  </dl>
+                  {device.specs && (
+                    <div className="mt-4 rounded-[var(--radius-sm)] border border-[var(--color-line)] bg-[var(--color-bg)] px-3 py-2 text-xs text-[var(--color-fg-subtle)]">
+                      {device.specs}
+                    </div>
+                  )}
+                </CardBody>
+              </Card>
+              <Card className="col-span-12 md:col-span-6">
+                <CardHeader>
+                  <CardTitle>
+                    <CardLabel>{t("Placement")}</CardLabel>
+                    <CardHeading>{t("Rack position")}</CardHeading>
+                  </CardTitle>
+                </CardHeader>
+                <CardBody>
+                  <dl className="space-y-2 text-xs">
+                    <Row
+                      label={t("Placement")}
+                      value={formatPlacement(device.placement, t)}
+                    />
+                    <Row label={t("Rack")} value={rack?.name} />
+                    <Row
+                      label={
+                        device.placement === "wireless"
+                          ? t("Connected AP")
+                          : device.placement === "virtual"
+                            ? t("Host device")
+                            : device.placement === "shelf"
+                              ? t("Rack shelf")
+                              : t("Parent")
+                      }
+                      value={
+                        device.parentDeviceId ? (
+                          parentDevice ? (
+                            <Link
+                              className="font-medium text-[var(--color-accent)] hover:underline"
+                              to={`/devices/${parentDevice.id}`}
+                            >
+                              {parentDevice.hostname}
+                            </Link>
+                          ) : (
+                            <span className="text-[var(--color-warning)]">
+                              {t("Host unavailable")}
+                            </span>
+                          )
+                        ) : undefined
+                      }
+                    />
+                    <Row label={t("Face")} value={device.face} />
+                    <Row
+                      label={t("Slot")}
+                      value={formatRackSlot(device.rackSlot, t)}
+                    />
+                    <Row
+                      label={t("U position")}
+                      value={
+                        device.startU
+                          ? formatRackUnit(device, t, true)
+                          : undefined
+                      }
+                    />
+                    <Row
+                      label={t("Last seen")}
+                      value={relativeTime(device.lastSeen)}
+                    />
+                  </dl>
+                </CardBody>
+              </Card>
+              {childDevices.length > 0 && (
+                <Card className="col-span-12">
+                  <CardHeader>
+                    <CardTitle>
+                      <CardLabel>{t("Relationships")}</CardLabel>
+                      <CardHeading>
+                        {baseDeviceType === "ap"
+                          ? t("Connected clients")
+                          : t("Hosted / child devices")}
+                      </CardHeading>
+                    </CardTitle>
+                  </CardHeader>
+                  <CardBody>
+                    {(device.cpuCores ||
+                      device.memoryGb ||
+                      device.storageGb) && (
+                      <div className="mb-3 grid gap-2 md:grid-cols-3">
+                        <SummaryPill
+                          label={t("CPU")}
+                          value={`${formatCapacityValue(childCapacity.cpu)} / ${formatCapacityValue(device.cpuCores)}`}
+                        />
+                        <SummaryPill
+                          label={t("Memory")}
+                          value={`${formatCapacityValue(childCapacity.memory)} / ${formatCapacityValue(device.memoryGb)} GB`}
+                        />
+                        <SummaryPill
+                          label={t("Storage")}
+                          value={`${formatCapacityValue(childCapacity.storage)} / ${formatCapacityValue(device.storageGb)} GB`}
+                        />
+                      </div>
+                    )}
+                    <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                      {childDevices
+                        .sort((a, b) => a.hostname.localeCompare(b.hostname))
+                        .map((child) => (
+                          <Link
+                            key={child.id}
+                            to={`/devices/${child.id}`}
+                            className="rounded-[var(--radius-sm)] border border-[var(--color-line)] bg-[var(--color-bg)] px-3 py-2 transition-colors hover:border-[var(--color-line-strong)] hover:bg-[var(--color-surface)]"
+                          >
+                            <div className="flex items-center gap-2">
+                              <DeviceTypeIcon
+                                type={child.deviceType}
+                                className="size-4 text-[var(--color-accent)]"
+                              />
+                              <span className="text-sm text-[var(--color-fg)]">
+                                {child.hostname}
+                              </span>
+                            </div>
+                            <div className="mt-1 text-[11px] text-[var(--color-fg-subtle)]">
+                              {child.displayName ||
+                                formatDeviceAddress(child) ||
+                                formatPlacement(child.placement, t)}
+                            </div>
+                          </Link>
+                        ))}
+                    </div>
+                  </CardBody>
+                </Card>
+              )}
+              {device.tags && device.tags.length > 0 && (
+                <Card className="col-span-12">
+                  <CardHeader>
+                    <CardTitle>
+                      <CardLabel>{t("Metadata")}</CardLabel>
+                      <CardHeading>{t("Tags")}</CardHeading>
+                    </CardTitle>
+                  </CardHeader>
+                  <CardBody>
+                    <div className="flex flex-wrap gap-1.5" data-no-i18n>
+                      {device.tags.map((tag) => (
+                        <Badge key={tag}>{tag}</Badge>
+                      ))}
+                    </div>
+                  </CardBody>
+                </Card>
+              )}
+              <Card className="col-span-12">
+                <CardHeader>
+                  <CardTitle>
+                    <CardLabel>{t("Documentation")}</CardLabel>
+                    <CardHeading>{t("Linked documentation")}</CardHeading>
+                  </CardTitle>
+                </CardHeader>
+                <CardBody className="space-y-2">
+                  {linkedDocumentationPages.length === 0 ? (
+                    <EmptyState
+                      title={t("No linked documentation yet.")}
+                      description={t(
+                        "Link pages from the Documentation workspace to this device.",
+                      )}
+                    />
+                  ) : (
+                    linkedDocumentationPages.map(({ link, page }) => (
+                      <Link
+                        key={link.id}
+                        to={`/documentation?pageId=${page!.id}`}
+                        className="rk-list-row flex items-center justify-between gap-3 px-3 py-2"
+                      >
+                        <span className="truncate text-sm text-[var(--text-primary)]">
+                          {page!.title}
+                        </span>
+                        <span className="text-[11px] text-[var(--text-tertiary)]">
+                          {relativeTime(page!.updatedAt)}
+                        </span>
+                      </Link>
+                    ))
+                  )}
+                </CardBody>
+              </Card>
+            </div>
+          </TabsContent>
+
+          <TabsContent value="ports" className="pt-4">
+            <div className="grid grid-cols-12 gap-4">
+              <div className="col-span-12 xl:col-span-8 space-y-4">
+                {canEdit ? (
+                  <Card>
+                    <CardBody className="space-y-3">
+                      <div className="flex flex-wrap items-end gap-3">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => {
+                            setCreatingPort(true);
+                            setSelectedPortId(undefined);
+                            setPortToolbarError("");
+                          }}
+                        >
+                          <Plus className="size-3.5" />
+                          {t("Add port")}
+                        </Button>
+                        {devicePorts.length === 0 &&
+                        compatiblePortTemplates.length > 0 ? (
+                          <>
+                            <Field label={t("Port templates")}>
+                              <Select
+                                value={selectedPortTemplateId}
+                                onChange={setSelectedPortTemplateId}
+                              >
+                                {compatiblePortTemplates.map((template) => (
+                                  <option key={template.id} value={template.id}>
+                                    {template.name}
+                                  </option>
+                                ))}
+                              </Select>
+                            </Field>
+                            <Button
+                              size="sm"
+                              onClick={() => void applyPortTemplate()}
+                              disabled={
+                                portTemplateApplying || !selectedPortTemplateId
+                              }
+                            >
+                              {portTemplateApplying
+                                ? t("Saving...")
+                                : t("Apply template")}
+                            </Button>
+                          </>
+                        ) : null}
+                        {devicePorts.length > 0 &&
+                        currentUser?.role === "admin" ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void savePortsAsTemplate()}
+                            disabled={portTemplateSaving}
+                          >
+                            {portTemplateSaving
+                              ? t("Saving...")
+                              : t("From device")}
+                          </Button>
+                        ) : null}
+                      </div>
+                      {portToolbarError ? (
+                        <div className="text-xs text-[var(--color-err)]">
+                          {portToolbarError}
+                        </div>
+                      ) : null}
+                    </CardBody>
+                  </Card>
+                ) : null}
+
+                {devicePorts.length === 0 ? (
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>
+                        <CardLabel>{t("Interfaces")}</CardLabel>
+                        <CardHeading>{t("No ports documented")}</CardHeading>
+                      </CardTitle>
+                    </CardHeader>
+                    <CardBody>
+                      <EmptyState
+                        title={t("No ports documented")}
+                        description={t(
+                          "Add or template ports for this device to inspect cabling, VLANs, and interface notes here.",
+                        )}
+                      />
+                      <div className="mt-3 flex justify-center">
+                        <Button variant="outline" size="sm" asChild>
+                          <Link to={`/ports?deviceId=${device.id}`}>
+                            <ExternalLink className="size-3.5" />
+                            {t("Open in ports workspace")}
+                          </Link>
+                        </Button>
+                      </div>
+                    </CardBody>
+                  </Card>
+                ) : isVisualGrid ? (
+                  <div className="space-y-4">
+                    <PortGrid
+                      device={device}
+                      ports={devicePorts}
+                      links={linkByPortId}
+                      portsById={portById}
+                      devicesById={deviceById}
+                      vlansById={vlanById}
+                      virtualSwitchesById={virtualSwitchById}
+                      snmpVerifiedPortIds={snmpVerifiedPortIds}
+                      onSelectPort={(portId) => {
+                        setCreatingPort(false);
+                        setSelectedPortId(portId);
+                      }}
+                      selectedPortId={creatingPort ? undefined : selectedPortId}
+                    />
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>
+                          <CardLabel>{t("Table")}</CardLabel>
+                          <CardHeading>{t("All ports")}</CardHeading>
+                        </CardTitle>
+                      </CardHeader>
+                      <CardBody className="p-0">
+                        <PortList
+                          ports={devicePorts}
+                          links={linkByPortId}
+                          portsById={portById}
+                          devicesById={deviceById}
+                          deviceTypes={deviceTypes}
+                          vlansById={vlanById}
+                          virtualSwitchesById={virtualSwitchById}
+                          snmpVerifiedPortIds={snmpVerifiedPortIds}
+                          onSelectPort={(portId) => {
+                            setCreatingPort(false);
+                            setSelectedPortId(portId);
+                          }}
+                          selectedPortId={
+                            creatingPort ? undefined : selectedPortId
+                          }
+                        />
+                      </CardBody>
+                    </Card>
+                  </div>
+                ) : (
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>
+                        <CardLabel>{t("Interfaces")}</CardLabel>
+                        <CardHeading>
+                          {devicePorts.length} {t("ports")}
+                        </CardHeading>
+                      </CardTitle>
+                    </CardHeader>
+                    <CardBody className="p-0">
+                      <PortList
+                        ports={devicePorts}
+                        links={linkByPortId}
+                        portsById={portById}
+                        devicesById={deviceById}
+                        deviceTypes={deviceTypes}
+                        vlansById={vlanById}
+                        virtualSwitchesById={virtualSwitchById}
+                        onSelectPort={(portId) => {
+                          setCreatingPort(false);
+                          setSelectedPortId(portId);
+                        }}
+                        selectedPortId={
+                          creatingPort ? undefined : selectedPortId
+                        }
+                      />
+                    </CardBody>
+                  </Card>
+                )}
+                <CablingMapPanel
+                  device={device}
+                  devices={devices}
+                  ports={ports}
+                  portLinks={portLinks}
+                  deviceTypes={deviceTypes}
+                />
+              </div>
+
+              <div className="col-span-12 xl:col-span-4">
+                <DevicePortEditor
+                  device={device}
+                  deviceTypes={deviceTypes}
+                  port={selectedPort}
+                  creating={creatingPort}
+                  canEdit={canEdit}
+                  devicePorts={devicePorts}
+                  vlans={vlans}
+                  virtualSwitches={virtualSwitches}
+                  peerPort={peerPort}
+                  peerDevice={peerDevice}
+                  link={selectedLink}
+                  showFaceInHeading={baseDeviceType === "patch_panel"}
+                  onCancelCreate={() => setCreatingPort(false)}
+                  onSaved={(savedPort) => {
+                    setCreatingPort(false);
+                    setSelectedPortId(savedPort.id);
+                  }}
+                  onDeleted={() => {
+                    setCreatingPort(false);
+                    setSelectedPortId(undefined);
+                  }}
+                />
+              </div>
+            </div>
+          </TabsContent>
+
+          <TabsContent value="physical" className="pt-4">
+            <DevicePhysicalLayoutPanel
+              device={device}
+              ports={devicePorts}
+              allPorts={ports}
+              portLinks={portLinks}
+              devices={devices}
+              deviceTypes={deviceTypes}
+              canEdit={canEdit && !isStack}
+              initialLayout={physicalLayout}
+              onLayoutChange={upsertPhysicalLayoutRecord}
+              onInventoryReload={() => loadAll(true)}
+            />
+          </TabsContent>
+
+          {showStorage && (
+            <TabsContent value="storage" className="pt-4">
+              <StorageTopologyPanel deviceId={device.id} />
+            </TabsContent>
+          )}
+
+          {showCompute && (
+            <TabsContent value="compute" className="pt-4">
+              <DeviceComputePanel deviceId={device.id} />
+            </TabsContent>
+          )}
+
+          <TabsContent value="network" className="pt-4">
+            {canEdit && (
+              <Card className="mb-4">
+                <CardHeader>
+                  <CardTitle>
+                    <CardLabel>{t("Assign address")}</CardLabel>
+                    <CardHeading>
+                      {editingAssignmentId
+                        ? t("Edit IP assignment")
+                        : t("Add device or interface IP")}
+                    </CardHeading>
+                  </CardTitle>
+                  {editingAssignmentId ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={cancelEditingAssignment}
+                    >
+                      {t("Cancel")}
+                    </Button>
+                  ) : null}
+                </CardHeader>
+                <CardBody className="space-y-3">
+                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                    <div className="md:col-span-2 xl:col-span-2">
+                      <Field label={t("Subnet")}>
+                        <Select
+                          value={networkForm.subnetId}
+                          onChange={(value) =>
+                            setNetworkField("subnetId", value)
+                          }
+                          disabled={subnets.length === 0}
+                        >
+                          <option value="">{t("Select subnet")}</option>
+                          {subnets.map((subnet) => (
+                            <option key={subnet.id} value={subnet.id}>
+                              {subnet.cidr} - {subnet.name}
+                            </option>
+                          ))}
+                        </Select>
+                      </Field>
+                    </div>
+                    <Field label={t("IP address")}>
+                      <Input
+                        data-testid="network-address-input"
+                        value={networkForm.ipAddress}
+                        onChange={(event) =>
+                          setNetworkField("ipAddress", event.target.value)
+                        }
+                        placeholder={networkAddressPlaceholder}
+                      />
+                    </Field>
+                    <Field label={t("Type")}>
+                      <Select
+                        value={networkForm.assignmentType}
+                        onChange={(value) =>
+                          setNetworkField(
+                            "assignmentType",
+                            value as IpAssignmentType,
+                          )
+                        }
+                      >
+                        <option value="interface">{t("Interface")}</option>
+                        <option value="device">{t("Device")}</option>
+                        <option value="infrastructure">
+                          {t("Infrastructure")}
+                        </option>
+                        <option value="reserved">{t("Reserved")}</option>
+                        <option value="vm">{t("VM")}</option>
+                        <option value="container">{t("Container")}</option>
+                      </Select>
+                    </Field>
+                    <Field label={t("Allocation")}>
+                      <Select
+                        value={networkForm.allocationMode}
+                        onChange={(value) =>
+                          setNetworkField(
+                            "allocationMode",
+                            value as IpAllocationMode,
+                          )
+                        }
+                      >
+                        <option value="static">{t("Static")}</option>
+                        <option value="dhcp-reservation">
+                          {t("DHCP reservation")}
+                        </option>
+                      </Select>
+                    </Field>
+                    <Field label={t("DHCP scope")}>
+                      <Select
+                        value={networkForm.dhcpScopeId}
+                        onChange={(value) =>
+                          setNetworkField("dhcpScopeId", value)
+                        }
+                        disabled={
+                          networkForm.allocationMode !== "dhcp-reservation"
+                        }
+                      >
+                        <option value="">{t("Auto / none")}</option>
+                        {scopesForNetworkSubnet.map((scope) => (
+                          <option key={scope.id} value={scope.id}>
+                            {scope.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                    <Field label={t("Port")}>
+                      <Select
+                        value={networkForm.portId}
+                        onChange={(value) => setNetworkField("portId", value)}
+                      >
+                        <option value="">{t("Device-level")}</option>
+                        {networkAssignablePorts.map((port) => (
+                          <option key={port.id} value={port.id}>
+                            {formatPortLabel(port, { includeFace: true })}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-[1fr_auto] md:items-end">
+                    <Field label={t("Description")}>
+                      <Input
+                        value={networkForm.description}
+                        onChange={(event) =>
+                          setNetworkField("description", event.target.value)
+                        }
+                        placeholder={t("Gateway, docker0, WAN, storage NIC...")}
+                      />
+                    </Field>
+                    <Button
+                      size="sm"
+                      onClick={() => void handleSaveIpAssignment()}
+                      disabled={networkSaving || subnets.length === 0}
+                    >
+                      <Plus className="size-3.5" />
+                      {networkSaving
+                        ? editingAssignmentId
+                          ? t("Saving...")
+                          : t("Assigning...")
+                        : editingAssignmentId
+                          ? t("Update IP")
+                          : t("Assign IP")}
+                    </Button>
+                  </div>
+                  {networkError && (
+                    <div className="rounded-[var(--radius-sm)] border border-[var(--color-err)]/30 bg-[var(--color-err)]/10 px-3 py-2 text-xs text-[var(--color-err)]">
+                      {networkError}
+                    </div>
+                  )}
+                </CardBody>
+              </Card>
+            )}
+            <Card>
+              <CardHeader>
+                <CardTitle>
+                  <CardLabel>{t("Addresses")}</CardLabel>
+                  <CardHeading>{t("IP assignments")}</CardHeading>
+                </CardTitle>
+              </CardHeader>
+              <CardBody className="p-0">
+                <div className="divide-y divide-[var(--color-line)]">
+                  {displayedDeviceIpCount === 0 ? (
+                    <div className="px-4 py-6 text-center text-xs text-[var(--color-fg-subtle)]">
+                      {t("No IPs assigned to this device.")}
+                    </div>
+                  ) : (
+                    <>
+                      {hostSharedAssignment && parentDevice && (
+                        <div className="grid gap-3 px-4 py-3 xl:grid-cols-12 xl:items-center">
+                          <Mono className="xl:col-span-2 text-[var(--color-fg)]">
+                            {hostSharedAssignment.ipAddress}
+                          </Mono>
+                          <div className="text-xs xl:col-span-2">
+                            {parentDevice.hostname}
+                            <Mono className="mt-0.5 block text-[10px] text-[var(--color-fg-muted)]">
+                              {t("shared parent address")}
+                            </Mono>
+                          </div>
+                          <div className="text-[11px] text-[var(--color-fg-subtle)] xl:col-span-4">
+                            {t("Host-network child using parent host IP")}
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2 xl:col-span-4 xl:justify-end">
+                            <Badge tone="neutral">{t("host network")}</Badge>
+                          </div>
+                        </div>
+                      )}
+                      {[...deviceIps]
+                        .sort((a, b) =>
+                          a.ipAddress.localeCompare(b.ipAddress, undefined, {
+                            numeric: true,
+                          }),
+                        )
+                        .map((ip) => (
+                          <div
+                            key={ip.id}
+                            className="grid gap-3 px-4 py-3 xl:grid-cols-12 xl:items-center"
+                          >
+                            <Mono className="text-[var(--color-fg)] xl:col-span-2">
+                              {ip.ipAddress}
+                            </Mono>
+                            <div className="text-xs xl:col-span-2">
+                              {subnetById[ip.subnetId]?.name ??
+                                ip.hostname ??
+                                "-"}
+                              <Mono className="mt-0.5 block text-[10px] text-[var(--color-fg-muted)]">
+                                {subnetById[ip.subnetId]?.cidr ?? ""}
+                              </Mono>
+                            </div>
+                            <div className="text-[11px] text-[var(--color-fg-subtle)] xl:col-span-3">
+                              <div>{ip.description ?? "-"}</div>
+                              {ip.portId && portById[ip.portId] && (
+                                <Mono className="mt-0.5 block text-[10px] text-[var(--color-fg-muted)]">
+                                  {formatPortLabel(portById[ip.portId], {
+                                    includeFace: true,
+                                  })}
+                                </Mono>
+                              )}
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2 xl:col-span-5 xl:justify-end">
+                              {ip.allocationMode === "dhcp-reservation" && (
+                                <Badge tone="neutral">{t("DHCP res")}</Badge>
+                              )}
+                              <Badge tone="cyan">{ip.assignmentType}</Badge>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                disabled={!canEdit || networkSaving}
+                                onClick={() => startEditingAssignment(ip)}
+                              >
+                                <Pencil className="size-3.5" />
+                                {t("Edit")}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                disabled={releasingId === ip.id || !canEdit}
+                                onClick={() => void handleUnassignIp(ip.id)}
+                              >
+                                {releasingId === ip.id
+                                  ? t("Releasing...")
+                                  : t("Unassign")}
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                    </>
+                  )}
+                </div>
+              </CardBody>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="monitoring" className="pt-4">
+            <Card>
+              <CardHeader>
+                <CardTitle>
+                  <CardLabel>{t("Health checks")}</CardLabel>
+                  <CardHeading>{t("Automated device monitoring")}</CardHeading>
+                </CardTitle>
+                <div className="flex items-center gap-2">
+                  <Badge tone={monitorStateTone}>
+                    <ShieldCheck className="size-3" />
+                    {device.status}
+                  </Badge>
+                  <Badge tone="neutral">
+                    {activeMonitorCount}/{deviceMonitorList.length}{" "}
+                    {t("active targets")}
+                  </Badge>
+                </div>
+              </CardHeader>
+              <CardBody className="space-y-4">
+                <div className="rounded-[var(--radius-sm)] border border-[var(--color-line)] bg-[var(--color-bg)] px-3 py-2 text-sm text-[var(--color-fg-subtle)]">
+                  {t(
+                    "Rackpad runs these checks from the server or Docker container itself. A device stays",
+                  )}
+                  <span className="mx-1 font-mono text-[var(--color-fg)]">
+                    {t("unknown")}
+                  </span>
+                  {t(
+                    "until at least one enabled target has run. For near-real-time link events, forward SNMP v1/v2c or SNMPv3 traps to this Rackpad host on UDP port 1162 (or map host 162 → container 1162). SNMPv3 traps require a matching lab credential on the trap source, device, or SNMP monitor.",
+                  )}
+                </div>
+
+                {canManageMonitoring && device?.labId && (
+                  <SnmpCredentialsPanel
+                    labId={device.labId}
+                    credentials={snmpCredentials}
+                    disabled={!canManageMonitoring}
+                    onChanged={async () => {
+                      if (!device.labId) return;
+                      setSnmpCredentials(
+                        await api.getSnmpCredentials({ labId: device.labId }),
+                      );
+                    }}
+                  />
+                )}
+
+                {canManageMonitoring && device?.labId && (
+                  <SnmpSyncPanel
+                    deviceId={device.id}
+                    labId={device.labId}
+                    target={monitorForm.target.trim() || device.managementIp}
+                    snmpCredentialId={device.snmpCredentialId}
+                    credentials={snmpCredentials}
+                    disabled={!canManageMonitoring}
+                    isAdmin={currentUser?.role === "admin"}
+                    onApplied={async () => {
+                      await loadAll(true);
+                    }}
+                  />
+                )}
+
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-[var(--radius-sm)] border border-[var(--color-line)] bg-[var(--color-bg)] px-3 py-2">
+                  <div className="text-sm text-[var(--color-fg-subtle)]">
+                    {t(
+                      "Use separate targets for management IPs, storage NICs, service ports, or VIPs on the same device.",
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void handleRunAllMonitors()}
+                      disabled={
+                        !canManageMonitoring ||
+                        allMonitorsRunning ||
+                        activeMonitorCount === 0
+                      }
+                    >
+                      <ShieldCheck className="size-3.5" />
+                      {allMonitorsRunning
+                        ? t("Running all...")
+                        : t("Run all targets")}
+                    </Button>
+                    {canManageMonitoring && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => void handleDiscoverSnmpInterfaces()}
+                        disabled={
+                          snmpDiscoverLoading ||
+                          snmpImportLoading ||
+                          !(monitorForm.target.trim() || device.managementIp)
+                        }
+                      >
+                        <RefreshCcw className="size-3.5" />
+                        {snmpDiscoverLoading
+                          ? t("Discovering...")
+                          : t("Discover SNMP interfaces")}
+                      </Button>
+                    )}
+                    {canManageMonitoring && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={startNewMonitor}
+                      >
+                        <Plus className="size-3.5" />
+                        {t("Add target")}
+                      </Button>
+                    )}
+                  </div>
+                </div>
+
+                {(snmpDiscoverError || snmpInterfaces.length > 0) && (
+                  <div className="space-y-3 rounded-[var(--radius-sm)] border border-[var(--color-line)] bg-[var(--color-bg)] px-3 py-3">
+                    {snmpDiscoverError && (
+                      <div className="text-sm text-[var(--color-danger)]">
+                        {snmpDiscoverError}
+                      </div>
+                    )}
+                    {snmpInterfaces.length > 0 && (
+                      <>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="text-sm text-[var(--color-fg)]">
+                            {t("Found")}
+                            {snmpInterfaces.length} {t("SNMP interface")}
+                            {snmpInterfaces.length === 1 ? "" : t("s")}{" "}
+                            {t("via IF-MIB.")}
+                          </div>
+                          <Button
+                            size="sm"
+                            onClick={() => void handleImportSnmpInterfaces()}
+                            disabled={snmpImportLoading}
+                          >
+                            {snmpImportLoading
+                              ? t("Creating monitors...")
+                              : t("Create ifOperStatus monitors")}
+                          </Button>
+                        </div>
+                        <div className="max-h-48 space-y-1 overflow-y-auto text-xs text-[var(--color-fg-subtle)]">
+                          {snmpInterfaces.map((entry) => (
+                            <div
+                              key={entry.ifIndex}
+                              className="flex items-center justify-between gap-3 rounded border border-[var(--color-line)] px-2 py-1"
+                            >
+                              <span className="min-w-0 flex-1 truncate">
+                                {entry.name || entry.descr} {t("(ifIndex")}{" "}
+                                {entry.ifIndex})
+                                {entry.matchedPortName ? (
+                                  <span className="ml-2 text-[var(--accent-secondary)]">
+                                    → {entry.matchedPortName}
+                                  </span>
+                                ) : (
+                                  <span className="ml-2 text-[var(--text-muted)]">
+                                    {t("· no port match")}
+                                  </span>
+                                )}
+                                {entry.highSpeedMbps ? (
+                                  <span className="ml-2 font-mono text-[var(--text-tertiary)]">
+                                    {entry.highSpeedMbps >= 1000
+                                      ? t("{value1}G", {
+                                          value1: entry.highSpeedMbps / 1000,
+                                        })
+                                      : t("{highSpeedMbps}M", {
+                                          highSpeedMbps: entry.highSpeedMbps,
+                                        })}
+                                  </span>
+                                ) : null}
+                              </span>
+                              <span className="shrink-0 font-mono">
+                                {entry.operStatusLabel ?? t("unknown")}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+
+                <div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
+                  <div className="space-y-2">
+                    {deviceMonitorList.length === 0 ? (
+                      <div className="rounded-[var(--radius-sm)] border border-dashed border-[var(--color-line)] bg-[var(--color-bg)] px-3 py-4 text-sm text-[var(--color-fg-subtle)]">
+                        {t("No monitor targets documented yet.")}
+                      </div>
+                    ) : (
+                      deviceMonitorList.map((entry) => (
+                        <button
+                          key={entry.id}
+                          data-testid="device-monitor-target"
+                          data-monitor-id={entry.id}
+                          type="button"
+                          onClick={() => setSelectedMonitorId(entry.id)}
+                          className={[
+                            "w-full rounded-[var(--radius-sm)] border px-3 py-3 text-left transition-colors",
+                            selectedMonitorId === entry.id
+                              ? "border-[var(--color-accent)] bg-[var(--color-accent)]/10"
+                              : "border-[var(--color-line)] bg-[var(--color-bg)] hover:border-[var(--color-line-strong)]",
+                          ].join(" ")}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="text-sm font-medium text-[var(--color-fg)]">
+                              {entry.name}
+                            </div>
+                            {entry.enabled && entry.type !== "none" ? (
+                              <Badge
+                                tone={
+                                  entry.lastResult === "online"
+                                    ? "ok"
+                                    : entry.lastResult === "offline"
+                                      ? "err"
+                                      : "neutral"
+                                }
+                              >
+                                {entry.lastResult ?? t("unknown")}
+                              </Badge>
+                            ) : (
+                              <Badge tone="neutral">{t("Disabled")}</Badge>
+                            )}
+                          </div>
+                          <div className="mt-1 font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-fg-subtle)]">
+                            {entry.type}
+                            {entry.target
+                              ? t("| {target}", { target: entry.target })
+                              : ""}
+                            {entry.port
+                              ? t(":{port}", { port: entry.port })
+                              : ""}
+                          </div>
+                          {entry.type === "https" && entry.ignoreTlsErrors && (
+                            <div className="mt-2">
+                              <Badge tone="warn">
+                                {t("TLS verification off")}
+                              </Badge>
+                            </div>
+                          )}
+                          <div className="mt-1 text-xs text-[var(--color-fg-subtle)]">
+                            {entry.lastMessage ?? t("No checks have run yet.")}
+                          </div>
+                        </button>
+                      ))
+                    )}
+                  </div>
+
+                  <div
+                    data-testid="device-monitor-editor"
+                    className="space-y-4 rounded-[var(--radius-sm)] border border-[var(--color-line)] bg-[var(--color-bg)] p-4"
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-fg-subtle)]">
+                          {selectedMonitor
+                            ? t("Monitor editor")
+                            : t("New target")}
+                        </div>
+                        <div className="text-base font-medium text-[var(--color-fg)]">
+                          {selectedMonitor
+                            ? selectedMonitor.name
+                            : t("Create a new monitor target")}
+                        </div>
+                      </div>
+                      {selectedMonitor &&
+                        (selectedMonitor.enabled &&
+                        selectedMonitor.type !== "none" ? (
+                          <Badge
+                            tone={
+                              selectedMonitor.lastResult === "online"
+                                ? "ok"
+                                : selectedMonitor.lastResult === "offline"
+                                  ? "err"
+                                  : "neutral"
+                            }
+                          >
+                            {selectedMonitor.lastResult ?? t("unknown")}
+                          </Badge>
+                        ) : (
+                          <Badge tone="neutral">{t("Disabled")}</Badge>
+                        ))}
+                    </div>
+
+                    <label className="flex items-center gap-2 rounded-[var(--radius-sm)] border border-[var(--color-line)] bg-[var(--color-surface)] px-3 py-2 text-sm text-[var(--color-fg)]">
+                      <input
+                        type="checkbox"
+                        checked={
+                          monitorForm.enabled && monitorForm.type !== "none"
+                        }
+                        disabled={
+                          !canManageMonitoring || monitorForm.type === "none"
+                        }
+                        onChange={(event) =>
+                          setMonitorForm((prev) => ({
+                            ...prev,
+                            enabled: event.target.checked,
+                          }))
+                        }
+                      />
+                      {t("Enable health checks for this target")}
+                    </label>
+
+                    <div className="rounded-[var(--radius-sm)] border border-[var(--color-line)] bg-[var(--color-surface)] px-3 py-2 text-sm text-[var(--color-fg-subtle)]">
+                      {monitorTypeDescription}
+                    </div>
+
+                    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                      <Field label={t("Name")}>
+                        <Input
+                          value={monitorForm.name}
+                          disabled={!canManageMonitoring}
+                          onChange={(event) =>
+                            setMonitorForm((prev) => ({
+                              ...prev,
+                              name: event.target.value,
+                            }))
+                          }
+                          placeholder={t("Management, Storage, WAN, VIP...")}
+                        />
+                      </Field>
+                      <Field label={t("Type")}>
+                        <Select
+                          value={monitorForm.type}
+                          onChange={(value) =>
+                            setMonitorForm((prev) => ({
+                              ...prev,
+                              type: value as MonitorForm["type"],
+                              enabled: value === "none" ? false : prev.enabled,
+                            }))
+                          }
+                          disabled={!canManageMonitoring}
+                        >
+                          <option value="none">{t("none")}</option>
+                          <option value="icmp">{t("icmp")}</option>
+                          <option value="tcp">{t("tcp")}</option>
+                          <option value="http">{t("http")}</option>
+                          <option value="https">{t("https")}</option>
+                          <option value="snmp">{t("snmp")}</option>
+                        </Select>
+                      </Field>
+                      <Field label={t("Target")}>
+                        <Input
+                          value={monitorForm.target}
+                          disabled={!canManageMonitoring}
+                          onChange={(event) =>
+                            setMonitorForm((prev) => ({
+                              ...prev,
+                              target: event.target.value,
+                            }))
+                          }
+                          placeholder={t("10.0.10.12 or host.example")}
+                        />
+                      </Field>
+                      <Field label={t("Every (minutes)")}>
+                        <Input
+                          value={monitorForm.intervalMinutes}
+                          disabled={!canManageMonitoring}
+                          onChange={(event) =>
+                            setMonitorForm((prev) => ({
+                              ...prev,
+                              intervalMinutes: event.target.value,
+                            }))
+                          }
+                          placeholder="5"
+                        />
+                      </Field>
+                    </div>
+
+                    <div className="grid gap-4 md:grid-cols-2">
+                      {showMonitorPortField && (
+                        <Field label={t("Port")}>
+                          <Input
+                            value={monitorForm.port}
+                            disabled={!canManageMonitoring}
+                            onChange={(event) =>
+                              setMonitorForm((prev) => ({
+                                ...prev,
+                                port: event.target.value,
+                              }))
+                            }
+                            placeholder={
+                              monitorForm.type === "tcp"
+                                ? "22, 443, 8006"
+                                : monitorForm.type === "https"
+                                  ? "443"
+                                  : monitorForm.type === "snmp"
+                                    ? "161"
+                                    : "80"
+                            }
+                          />
+                        </Field>
+                      )}
+                      {showMonitorPathField && (
+                        <Field label={t("HTTP path")}>
+                          <Input
+                            value={monitorForm.path}
+                            disabled={!canManageMonitoring}
+                            onChange={(event) =>
+                              setMonitorForm((prev) => ({
+                                ...prev,
+                                path: event.target.value,
+                              }))
+                            }
+                            placeholder={t("/health")}
+                          />
+                        </Field>
+                      )}
+                    </div>
+
+                    {monitorForm.type === "https" && (
+                      <label className="flex items-start gap-2 rounded-[var(--radius-sm)] border border-[var(--color-warn)]/35 bg-[var(--color-warn)]/8 px-3 py-2 text-sm text-[var(--color-fg)]">
+                        <input
+                          type="checkbox"
+                          checked={monitorForm.ignoreTlsErrors}
+                          disabled={!canManageMonitoring}
+                          onChange={(event) =>
+                            setMonitorForm((prev) => ({
+                              ...prev,
+                              ignoreTlsErrors: event.target.checked,
+                            }))
+                          }
+                          className="mt-0.5 accent-[var(--color-warn)]"
+                        />
+                        <span>
+                          <span className="block font-medium">
+                            {t("Ignore TLS certificate errors")}
+                          </span>
+                          <span className="mt-0.5 block text-xs text-[var(--color-fg-subtle)]">
+                            {t(
+                              "Allows self-signed, expired, or mismatched certificates. Use only for trusted targets.",
+                            )}
+                          </span>
+                        </span>
+                      </label>
+                    )}
+
+                    {showMonitorSnmpFields && (
+                      <div className="grid gap-4 md:grid-cols-2">
+                        <Field label={t("OID preset")}>
+                          <Select
+                            value=""
+                            disabled={!canManageMonitoring}
+                            onChange={(value) => {
+                              const preset = SNMP_OID_PRESETS.find(
+                                (entry) => entry.id === value,
+                              );
+                              if (!preset || preset.id === "custom") return;
+                              setMonitorForm((prev) => {
+                                const ifIndex = prev.snmpIfIndex.trim()
+                                  ? Number.parseInt(prev.snmpIfIndex, 10)
+                                  : null;
+                                const oid =
+                                  preset.id === "ifOperStatus" &&
+                                  ifIndex != null
+                                    ? `${preset.oid}.${ifIndex}`
+                                    : preset.oid;
+                                return {
+                                  ...prev,
+                                  snmpOid: oid,
+                                  snmpExpectedValue: preset.expected,
+                                  snmpMatchMode: preset.matchMode,
+                                };
+                              });
+                            }}
+                          >
+                            <option value="">{t("Apply preset…")}</option>
+                            {SNMP_OID_PRESETS.filter(
+                              (entry) => entry.id !== "custom",
+                            ).map((preset) => (
+                              <option key={preset.id} value={preset.id}>
+                                {preset.label}
+                              </option>
+                            ))}
+                          </Select>
+                        </Field>
+                        <Field label={t("Match mode")}>
+                          <Select
+                            value={monitorForm.snmpMatchMode}
+                            disabled={!canManageMonitoring}
+                            onChange={(value) =>
+                              setMonitorForm((prev) => ({
+                                ...prev,
+                                snmpMatchMode:
+                                  value as MonitorForm["snmpMatchMode"],
+                              }))
+                            }
+                          >
+                            {SNMP_MATCH_MODE_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </Select>
+                        </Field>
+                        <Field label={t("Linked port")}>
+                          <Select
+                            value={monitorForm.portId}
+                            disabled={!canManageMonitoring}
+                            onChange={(value) => {
+                              const linkedPort = devicePorts.find(
+                                (port) => port.id === value,
+                              );
+                              setMonitorForm((prev) => {
+                                const ifIndex =
+                                  linkedPort?.snmpIfIndex != null
+                                    ? String(linkedPort.snmpIfIndex)
+                                    : prev.snmpIfIndex;
+                                const nextOid =
+                                  prev.snmpOid.startsWith(
+                                    "1.3.6.1.2.1.2.2.1.8",
+                                  ) && linkedPort?.snmpIfIndex != null
+                                    ? `1.3.6.1.2.1.2.2.1.8.${linkedPort.snmpIfIndex}`
+                                    : prev.snmpOid;
+                                return {
+                                  ...prev,
+                                  portId: value,
+                                  snmpIfIndex: ifIndex,
+                                  snmpOid: nextOid,
+                                };
+                              });
+                            }}
+                          >
+                            <option value="">{t("None")}</option>
+                            {devicePorts.map((port) => (
+                              <option key={port.id} value={port.id}>
+                                {port.name}
+                                {port.snmpIfIndex != null
+                                  ? t("(ifIndex {snmpIfIndex})", {
+                                      snmpIfIndex: port.snmpIfIndex,
+                                    })
+                                  : ""}
+                              </option>
+                            ))}
+                          </Select>
+                        </Field>
+                        <Field label={t("ifIndex")}>
+                          <Input
+                            value={monitorForm.snmpIfIndex}
+                            disabled={!canManageMonitoring}
+                            onChange={(event) =>
+                              setMonitorForm((prev) => ({
+                                ...prev,
+                                snmpIfIndex: event.target.value,
+                              }))
+                            }
+                            placeholder={t("Optional SNMP ifIndex")}
+                          />
+                        </Field>
+                        <Field label={t("Credential")}>
+                          <Select
+                            value={monitorForm.snmpCredentialId}
+                            disabled={!canManageMonitoring}
+                            onChange={(value) => {
+                              const credential = snmpCredentials.find(
+                                (entry) => entry.id === value,
+                              );
+                              setMonitorForm((prev) => ({
+                                ...prev,
+                                snmpCredentialId: value,
+                                snmpVersion:
+                                  credential?.version ?? prev.snmpVersion,
+                              }));
+                            }}
+                          >
+                            <option value="">
+                              {t("Inline community / version")}
+                            </option>
+                            {snmpCredentials.map((credential) => (
+                              <option key={credential.id} value={credential.id}>
+                                {credential.name} {t("(v")}
+                                {credential.version})
+                              </option>
+                            ))}
+                          </Select>
+                        </Field>
+                        <Field label={t("SNMP version")}>
+                          <Select
+                            value={monitorForm.snmpVersion}
+                            disabled={
+                              !canManageMonitoring ||
+                              Boolean(monitorForm.snmpCredentialId)
+                            }
+                            onChange={(value) =>
+                              setMonitorForm((prev) => ({
+                                ...prev,
+                                snmpVersion:
+                                  value as MonitorForm["snmpVersion"],
+                              }))
+                            }
+                          >
+                            <option value="2c">{t("v2c")}</option>
+                            <option value="1">{t("v1")}</option>
+                            <option value="3">{t("v3")}</option>
+                          </Select>
+                        </Field>
+                        <Field label={t("Community")}>
+                          <Input
+                            type="password"
+                            autoComplete="new-password"
+                            value={monitorForm.snmpCommunity}
+                            disabled={
+                              !canManageMonitoring ||
+                              Boolean(monitorForm.snmpCredentialId)
+                            }
+                            onChange={(event) =>
+                              setMonitorForm((prev) => ({
+                                ...prev,
+                                snmpCommunity: event.target.value,
+                                clearSnmpCommunity: false,
+                              }))
+                            }
+                            placeholder={selectedMonitor?.hasSnmpCommunity ? t("Leave blank to keep the stored secret") : t("public")}
+                          />
+                          {selectedMonitor?.hasSnmpCommunity && !monitorForm.clearSnmpCommunity && (
+                            <div className="flex items-center justify-between text-xs text-text-muted">
+                              <span>{t("community stored")}</span>
+                              <button type="button" disabled={!canManageMonitoring} onClick={() => setMonitorForm((prev) => ({ ...prev, snmpCommunity: "", clearSnmpCommunity: true }))}>{t("Clear")}</button>
+                            </div>
+                          )}
+                        </Field>
+                        <Field label={t("OID")}>
+                          <Input
+                            value={monitorForm.snmpOid}
+                            disabled={!canManageMonitoring}
+                            onChange={(event) =>
+                              setMonitorForm((prev) => ({
+                                ...prev,
+                                snmpOid: event.target.value,
+                              }))
+                            }
+                            placeholder=".1.3.6.1.2.1.2.2.1.8.1"
+                          />
+                        </Field>
+                        <Field label={t("Expected value")}>
+                          <Input
+                            value={monitorForm.snmpExpectedValue}
+                            disabled={!canManageMonitoring}
+                            onChange={(event) =>
+                              setMonitorForm((prev) => ({
+                                ...prev,
+                                snmpExpectedValue: event.target.value,
+                              }))
+                            }
+                            placeholder={t(
+                              "Optional, e.g. 1 for ifOperStatus up",
+                            )}
+                          />
+                        </Field>
+                      </div>
+                    )}
+
+                    <div className="space-y-2 rounded-[var(--radius-sm)] border border-[var(--color-line)] bg-[var(--color-surface)] p-4">
+                      {selectedMonitor &&
+                        (!selectedMonitor.enabled ||
+                          selectedMonitor.type === "none") && (
+                          <div className="rk-kicker">{t("History")}</div>
+                        )}
+                      <div className="grid gap-3 md:grid-cols-3">
+                        <MonitorStat
+                          label={t("Last check")}
+                          value={
+                            selectedMonitor?.lastCheckAt
+                              ? new Date(
+                                  selectedMonitor.lastCheckAt,
+                                ).toLocaleString()
+                              : t("Never")
+                          }
+                        />
+                        <MonitorStat
+                          label={t("Last result")}
+                          value={selectedMonitor?.lastResult ?? t("unknown")}
+                        />
+                        <MonitorStat
+                          label={t("Message")}
+                          value={
+                            selectedMonitor?.lastMessage ??
+                            t("No checks have run yet.")
+                          }
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {monitorError && (
+                  <div className="rounded-[var(--radius-sm)] border border-[var(--color-err)]/30 bg-[var(--color-err)]/10 px-3 py-2 text-sm text-[var(--color-err)]">
+                    {monitorError}
+                  </div>
+                )}
+
+                {!canManageMonitoring && (
+                  <div className="rounded-[var(--radius-sm)] border border-[var(--color-info)]/30 bg-[var(--color-info-bg)] px-3 py-2 text-sm text-[var(--color-info)]">
+                    {t(
+                      "Only administrators can create, edit, delete, or run active monitor targets.",
+                    )}
+                  </div>
+                )}
+
+                <div className="flex items-center justify-end gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleRunMonitor()}
+                    disabled={
+                      !canManageMonitoring ||
+                      monitorRunning ||
+                      !selectedMonitor ||
+                      !selectedMonitor.enabled ||
+                      selectedMonitor.type === "none"
+                    }
+                  >
+                    <ShieldCheck className="size-3.5" />
+                    {monitorRunning ? t("Running...") : t("Run now")}
+                  </Button>
+                  {canManageMonitoring && selectedMonitor && (
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={() => void handleDeleteMonitor()}
+                      disabled={monitorDeleting}
+                    >
+                      <Trash2 className="size-3.5" />
+                      {monitorDeleting ? t("Deleting...") : t("Delete target")}
+                    </Button>
+                  )}
+                  {canManageMonitoring && (
+                    <Button
+                      size="sm"
+                      onClick={() => void handleSaveMonitor()}
+                      disabled={monitorSaving}
+                    >
+                      <Save className="size-3.5" />
+                      {monitorSaving
+                        ? t("Saving...")
+                        : selectedMonitor
+                          ? t("Save target")
+                          : t("Create target")}
+                    </Button>
+                  )}
+                </div>
+              </CardBody>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="services" className="pt-4">
+            <Card>
+              <CardHeader>
+                <CardTitle>
+                  <CardLabel>{t("Service inventory")}</CardLabel>
+                  <CardHeading>
+                    {t("Applications and network services")}
+                  </CardHeading>
+                </CardTitle>
+                {canManageMonitoring && (
+                  <Button variant="outline" size="sm" onClick={startNewService}>
+                    <Plus className="size-3.5" />
+                    {t("Add service")}
+                  </Button>
+                )}
+              </CardHeader>
+              <CardBody className="space-y-4">
+                <div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
+                  <div className="space-y-2">
+                    {deviceServiceList.length === 0 ? (
+                      <EmptyState title={t("No services documented yet.")} />
+                    ) : (
+                      deviceServiceList.map((service) => (
+                        <button
+                          key={service.id}
+                          type="button"
+                          onClick={() => setSelectedServiceId(service.id)}
+                          className={[
+                            "w-full rounded-[var(--radius-sm)] border px-3 py-3 text-left transition-colors",
+                            selectedServiceId === service.id
+                              ? "border-[var(--color-accent)] bg-[var(--color-accent)]/10"
+                              : "border-[var(--color-line)] bg-[var(--color-bg)] hover:border-[var(--color-line-strong)]",
+                          ].join(" ")}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="truncate text-sm font-medium text-[var(--color-fg)]">
+                              {service.name}
+                            </div>
+                            <Badge tone="neutral">
+                              {serviceTypeLabel(service.serviceType)}
+                            </Badge>
+                          </div>
+                          <div className="mt-1 text-xs text-[var(--color-fg-subtle)]">
+                            {service.url ||
+                              service.notes ||
+                              linkedServiceSummary(
+                                service,
+                                ipAssignments,
+                                portById,
+                                vlanById,
+                                deviceMonitorList,
+                              )}
+                          </div>
+                        </button>
+                      ))
+                    )}
+                  </div>
+
+                  <div className="space-y-4 rounded-[var(--radius-sm)] border border-[var(--color-line)] bg-[var(--color-bg)] p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-fg-subtle)]">
+                          {selectedService
+                            ? t("Service editor")
+                            : t("New service")}
+                        </div>
+                        <div className="text-base font-medium text-[var(--color-fg)]">
+                          {selectedService
+                            ? selectedService.name
+                            : t("Document a service on this device")}
+                        </div>
+                      </div>
+                      {selectedService && (
+                        <Badge tone="neutral">
+                          {serviceTypeLabel(selectedService.serviceType)}
+                        </Badge>
+                      )}
+                    </div>
+
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <Field label={t("Name")}>
+                        <Input
+                          value={serviceForm.name}
+                          disabled={!canManageMonitoring}
+                          onChange={(event) =>
+                            setServiceField("name", event.target.value)
+                          }
+                          placeholder={t("e.g. DHCP, Grafana, Portainer")}
+                        />
+                      </Field>
+                      <Field label={t("Type")}>
+                        <Select
+                          value={serviceForm.serviceType}
+                          disabled={!canManageMonitoring}
+                          onChange={(value) =>
+                            setServiceField(
+                              "serviceType",
+                              value as DeviceServiceType,
+                            )
+                          }
+                        >
+                          {SERVICE_TYPES.map((type) => (
+                            <option key={type} value={type}>
+                              {serviceTypeLabel(type)}
+                            </option>
+                          ))}
+                        </Select>
+                      </Field>
+                      <Field label={t("IP")}>
+                        <Select
+                          value={serviceForm.ipAssignmentId}
+                          disabled={!canManageMonitoring}
+                          onChange={(value) =>
+                            setServiceField("ipAssignmentId", value)
+                          }
+                        >
+                          <option value="">{t("No IP link")}</option>
+                          {deviceIps.map((assignment) => (
+                            <option key={assignment.id} value={assignment.id}>
+                              {assignment.ipAddress} ·{" "}
+                              {subnetById[assignment.subnetId]?.name ??
+                                assignment.assignmentType}
+                            </option>
+                          ))}
+                        </Select>
+                      </Field>
+                      <Field label={t("Port")}>
+                        <Select
+                          value={serviceForm.portId}
+                          disabled={!canManageMonitoring}
+                          onChange={(value) => setServiceField("portId", value)}
+                        >
+                          <option value="">{t("No port link")}</option>
+                          {devicePorts.map((port) => (
+                            <option key={port.id} value={port.id}>
+                              {formatPortLabel(port, { includeFace: true })}
+                            </option>
+                          ))}
+                        </Select>
+                      </Field>
+                      <Field label={t("VLAN")}>
+                        <Select
+                          value={serviceForm.vlanId}
+                          disabled={!canManageMonitoring}
+                          onChange={(value) => setServiceField("vlanId", value)}
+                        >
+                          <option value="">{t("No VLAN link")}</option>
+                          {vlans.map((vlan) => (
+                            <option key={vlan.id} value={vlan.id}>
+                              {t("VLAN")}
+                              {vlan.vlanId} · {vlan.name}
+                            </option>
+                          ))}
+                        </Select>
+                      </Field>
+                      <Field label={t("Monitor")}>
+                        <Select
+                          value={serviceForm.monitorId}
+                          disabled={!canManageMonitoring}
+                          onChange={(value) =>
+                            setServiceField("monitorId", value)
+                          }
+                        >
+                          <option value="">{t("No monitor link")}</option>
+                          {deviceMonitorList.map((monitor) => (
+                            <option key={monitor.id} value={monitor.id}>
+                              {monitor.name} · {monitor.type}
+                            </option>
+                          ))}
+                        </Select>
+                      </Field>
+                    </div>
+
+                    <Field label={t("URL")}>
+                      <Input
+                        value={serviceForm.url}
+                        disabled={!canManageMonitoring}
+                        onChange={(event) =>
+                          setServiceField("url", event.target.value)
+                        }
+                        placeholder={t("https://host.example:8443/")}
+                      />
+                    </Field>
+                    <Field label={t("Notes")}>
+                      <textarea
+                        value={serviceForm.notes}
+                        disabled={!canManageMonitoring}
+                        onChange={(event) =>
+                          setServiceField("notes", event.target.value)
+                        }
+                        rows={3}
+                        className="rk-control rk-textarea w-full text-sm"
+                        placeholder={t(
+                          "Owner, role, dependencies, or failover notes...",
+                        )}
+                      />
+                    </Field>
+
+                    {serviceError && (
+                      <div className="rounded-[var(--radius-sm)] border border-[var(--color-err)]/30 bg-[var(--color-err)]/10 px-3 py-2 text-sm text-[var(--color-err)]">
+                        {serviceError}
+                      </div>
+                    )}
+
+                    <div className="flex items-center justify-end gap-2">
+                      {canManageMonitoring && selectedService && (
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          onClick={() => void handleDeleteService()}
+                          disabled={serviceDeleting}
+                        >
+                          <Trash2 className="size-3.5" />
+                          {serviceDeleting
+                            ? t("Deleting...")
+                            : t("Delete service")}
+                        </Button>
+                      )}
+                      {canManageMonitoring && (
+                        <Button
+                          size="sm"
+                          onClick={() => void handleSaveService()}
+                          disabled={serviceSaving}
+                        >
+                          <Save className="size-3.5" />
+                          {serviceSaving
+                            ? t("Saving...")
+                            : selectedService
+                              ? t("Save service")
+                              : t("Create service")}
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </CardBody>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="images" className="pt-4">
+            <div className="grid grid-cols-12 gap-4">
+              {canEdit && (
+                <Card className="col-span-12 lg:col-span-4">
+                  <CardHeader>
+                    <CardTitle>
+                      <CardLabel>{t("Reference")}</CardLabel>
+                      <CardHeading>{t("Add image")}</CardHeading>
+                    </CardTitle>
+                  </CardHeader>
+                  <CardBody className="space-y-3">
+                    {imageError && (
+                      <div className="rounded-[var(--radius-sm)] border border-[var(--color-err)]/30 bg-[var(--color-err)]/10 px-3 py-2 text-sm text-[var(--color-err)]">
+                        {imageError}
+                      </div>
+                    )}
+                    <Input
+                      value={imageLabel}
+                      onChange={(event) => setImageLabel(event.target.value)}
+                      placeholder={t("Label")}
+                    />
+                    <textarea
+                      value={imageNotes}
+                      onChange={(event) => setImageNotes(event.target.value)}
+                      className="rk-control rk-textarea min-h-24 w-full text-sm"
+                      placeholder={t("Notes")}
+                    />
+                    <div className="flex items-center justify-between gap-3">
+                      <Mono className="text-[10px] text-[var(--color-fg-subtle)]">
+                        {imageSizeLimitLabel()} {t("max")}
+                      </Mono>
+                      <Button
+                        size="sm"
+                        onClick={() => imageInputRef.current?.click()}
+                        disabled={imageSaving}
+                      >
+                        <ImagePlus className="size-3.5" />
+                        {imageSaving ? t("Adding...") : t("Choose image")}
+                      </Button>
+                    </div>
+                  </CardBody>
+                </Card>
+              )}
+
+              <Card
+                className={
+                  canEdit ? "col-span-12 lg:col-span-8" : "col-span-12"
+                }
+              >
+                <CardHeader>
+                  <CardTitle>
+                    <CardLabel>{t("Reference")}</CardLabel>
+                    <CardHeading>
+                      {deviceImageList.length} {t("images")}
+                    </CardHeading>
+                  </CardTitle>
+                </CardHeader>
+                <CardBody>
+                  {deviceImageList.length === 0 ? (
+                    <EmptyState
+                      title={t("No images attached to this device yet.")}
+                    />
+                  ) : (
+                    <div className="grid gap-4 md:grid-cols-2">
+                      {deviceImageList.map((image) => (
+                        <div
+                          key={image.id}
+                          className="overflow-hidden rounded-[var(--radius-md)] border border-[var(--color-line)] bg-[var(--color-bg)]"
+                        >
+                          <img
+                            src={image.dataUrl}
+                            alt={image.label}
+                            className="h-56 w-full bg-black/20 object-contain"
+                            loading="lazy"
+                          />
+                          <div className="space-y-2 border-t border-[var(--color-line)] p-3">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="truncate text-sm font-medium text-[var(--color-fg)]">
+                                  {image.label}
+                                </div>
+                                <Mono className="text-[10px] text-[var(--color-fg-subtle)]">
+                                  {relativeTime(image.createdAt)}
+                                </Mono>
+                              </div>
+                              <div className="flex shrink-0 items-center gap-1">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => handleOpenImage(image)}
+                                  aria-label={t("Open {label} larger", {
+                                    label: image.label,
+                                  })}
+                                >
+                                  <ExternalLink />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => handleDownloadImage(image)}
+                                  aria-label={t("Download {label}", {
+                                    label: image.label,
+                                  })}
+                                >
+                                  <Download />
+                                </Button>
+                                {canEdit && (
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    onClick={() =>
+                                      void handleDeleteImage(image)
+                                    }
+                                    disabled={imageDeletingId === image.id}
+                                    aria-label={t("Delete {label}", {
+                                      label: image.label,
+                                    })}
+                                  >
+                                    <Trash2 />
+                                  </Button>
+                                )}
+                              </div>
+                            </div>
+                            {image.notes && (
+                              <div
+                                className="text-xs leading-5 text-[var(--color-fg-subtle)]"
+                                data-no-i18n
+                              >
+                                {image.notes}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </CardBody>
+              </Card>
+            </div>
+          </TabsContent>
+
+          <TabsContent value="notes" className="pt-4">
+            <Card>
+              <CardHeader>
+                <CardTitle>
+                  <CardLabel>{t("Documentation")}</CardLabel>
+                  <CardHeading>{t("Device notes")}</CardHeading>
+                </CardTitle>
+                {canEdit && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setDrawerOpen(true)}
+                  >
+                    <Pencil className="size-3.5" />
+                    {t("Edit notes")}
+                  </Button>
+                )}
+              </CardHeader>
+              <CardBody>
+                {device.notes?.trim() ? (
+                  <div
+                    className="whitespace-pre-wrap text-sm leading-6 text-[var(--color-fg)]"
+                    data-no-i18n
+                  >
+                    {device.notes}
+                  </div>
+                ) : (
+                  <EmptyState
+                    title={t("No notes documented for this device yet.")}
+                  />
+                )}
+              </CardBody>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="activity" className="pt-4">
+            <Card>
+              <CardHeader>
+                <CardTitle>
+                  <CardLabel>{t("History")}</CardLabel>
+                  <CardHeading>{t("Audit log")}</CardHeading>
+                </CardTitle>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handleLoadMoreActivity()}
+                  disabled={activityLoading}
+                >
+                  <RefreshCcw className="size-3.5" />
+                  {activityLoading ? t("Loading...") : t("Load more")}
+                </Button>
+              </CardHeader>
+              <CardBody className="p-0">
+                {activityError && (
+                  <div className="border-b border-[var(--color-line)] px-4 py-3 text-sm text-[var(--color-err)]">
+                    {activityError}
+                  </div>
+                )}
+                <ul className="divide-y divide-[var(--color-line)]">
+                  {activityEntries.length === 0 ? (
+                    <li className="px-4 py-2">
+                      <EmptyState
+                        title={t("No audit entries for this device.")}
+                      />
+                    </li>
+                  ) : (
+                    activityEntries.map((entry) => (
+                      <li
+                        key={entry.id}
+                        className="flex items-start gap-3 px-4 py-2.5 hover:bg-[var(--color-surface)]/40"
+                      >
+                        <span className="mt-1 size-1.5 shrink-0 rounded-full bg-[var(--color-accent)]" />
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs">{entry.summary}</div>
+                          <div className="mt-0.5 flex items-center gap-2">
+                            <Mono className="text-[10px] text-[var(--color-fg-subtle)]">
+                              {entry.user}
+                            </Mono>
+                            <span className="text-[10px] text-[var(--color-fg-faint)]">
+                              |
+                            </span>
+                            <Mono className="text-[10px] text-[var(--color-fg-subtle)]">
+                              {entry.action}
+                            </Mono>
+                          </div>
+                        </div>
+                        <span className="whitespace-nowrap font-mono text-[10px] text-[var(--color-fg-faint)]">
+                          {relativeTime(entry.ts)}
+                        </span>
+                      </li>
+                    ))
+                  )}
+                </ul>
+              </CardBody>
+            </Card>
+          </TabsContent>
+        </Tabs>
+      </div>
+
+      {canEdit && (
+        <DeviceDrawer
+          device={device}
+          open={drawerOpen}
+          onClose={() => setDrawerOpen(false)}
+        />
+      )}
+    </>
+  );
+}
+
+function Field({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <label className="block">
+      <span className="mb-1 block font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--color-fg-subtle)]">
+        {label}
+      </span>
+      {children}
+    </label>
+  );
+}
+
+function Select({
+  value,
+  onChange,
+  disabled,
+  children,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  disabled?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <select
+      value={value}
+      disabled={disabled}
+      onChange={(event) => onChange(event.target.value)}
+      className="h-8 w-full rounded-[var(--radius-sm)] border border-[var(--color-line)] bg-[var(--color-bg)] px-2 text-sm text-[var(--color-fg)] focus-visible:border-[var(--color-accent-soft)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent-soft)]"
+    >
+      {children}
+    </select>
+  );
+}
+
+function MonitorStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--color-fg-subtle)]">
+        {label}
+      </div>
+      <div className="mt-1 text-sm text-[var(--color-fg)]">{value}</div>
+    </div>
+  );
+}
+
+function Row({
+  label,
+  value,
+  mono,
+}: {
+  label: string;
+  value?: ReactNode;
+  mono?: boolean;
+}) {
+  if (!value) return null;
+  return (
+    <div className="flex items-baseline justify-between gap-3 capitalize">
+      <dt className="font-mono text-[10px] uppercase tracking-wider text-[var(--color-fg-subtle)]">
+        {label}
+      </dt>
+      <dd
+        className={`text-right text-[var(--color-fg)] normal-case ${mono ? "font-mono text-[11px]" : "text-xs"}`}
+      >
+        {value}
+      </dd>
+    </div>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  mono,
+}: {
+  label: string;
+  value?: string;
+  mono?: boolean;
+}) {
+  return (
+    <div>
+      <dt className="font-mono text-[9px] uppercase tracking-wider text-[var(--color-fg-subtle)]">
+        {label}
+      </dt>
+      <dd
+        className={`break-words ${
+          mono ? "font-mono text-[var(--color-fg)]" : "text-[var(--color-fg)]"
+        }`}
+      >
+        {value ?? "-"}
+      </dd>
+    </div>
+  );
+}
+
+function SummaryPill({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-[var(--radius-sm)] border border-[var(--color-line)] bg-[var(--color-bg)] px-3 py-2">
+      <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--color-fg-subtle)]">
+        {label}
+      </div>
+      <div className="mt-1 text-sm text-[var(--color-fg)]">{value}</div>
+    </div>
+  );
+}
+
+function serviceToForm(service: DeviceService): ServiceForm {
+  return {
+    name: service.name,
+    serviceType: service.serviceType,
+    ipAssignmentId: service.ipAssignmentId ?? "",
+    portId: service.portId ?? "",
+    vlanId: service.vlanId ?? "",
+    monitorId: service.monitorId ?? "",
+    url: service.url ?? "",
+    notes: service.notes ?? "",
+  };
+}
+
+function serviceTypeLabel(type: DeviceServiceType) {
+  switch (type) {
+    case "dhcp":
+      return "DHCP";
+    case "dns":
+      return "DNS";
+    case "vpn":
+      return "VPN";
+    case "ntp":
+      return "NTP";
+    case "snmp":
+      return "SNMP";
+    case "syslog":
+      return "Syslog";
+    case "http":
+      return "HTTP";
+    case "https":
+      return "HTTPS";
+    case "database":
+      return "Database";
+    case "app":
+      return "App";
+    default:
+      return "Custom";
+  }
+}
+
+function linkedServiceSummary(
+  service: DeviceService,
+  assignments: IpAssignment[],
+  portsById: Record<string, Port>,
+  vlansById: Record<string, Vlan>,
+  monitors: DeviceMonitor[],
+) {
+  const ip = service.ipAssignmentId
+    ? assignments.find((entry) => entry.id === service.ipAssignmentId)
+    : undefined;
+  const port = service.portId ? portsById[service.portId] : undefined;
+  const vlan = service.vlanId ? vlansById[service.vlanId] : undefined;
+  const monitor = service.monitorId
+    ? monitors.find((entry) => entry.id === service.monitorId)
+    : undefined;
+
+  return (
+    [
+      ip?.ipAddress,
+      port?.name,
+      vlan ? `VLAN ${vlan.vlanId}` : undefined,
+      monitor?.name,
+    ]
+      .filter(Boolean)
+      .join(" | ") || "No linked target"
+  );
+}
+
+function buildNewMonitorForm(
+  device: Device,
+  existingCount: number,
+): MonitorForm {
+  const defaultTarget = existingCount === 0 ? (device.managementIp ?? "") : "";
+  return {
+    name: existingCount === 0 ? "Management" : `Target ${existingCount + 1}`,
+    enabled: Boolean(defaultTarget),
+    type: defaultTarget ? "icmp" : "none",
+    target: defaultTarget,
+    port: "",
+    path: "",
+    ignoreTlsErrors: false,
+    snmpVersion: "2c",
+    snmpCommunity: "public",
+    clearSnmpCommunity: false,
+    snmpOid: "",
+    snmpExpectedValue: "",
+    snmpMatchMode: "equals",
+    portId: "",
+    snmpIfIndex: "",
+    snmpCredentialId: "",
+    intervalMinutes: "5",
+  };
+}
+
+function monitorToForm(monitor: DeviceMonitor, device: Device): MonitorForm {
+  return {
+    name: monitor.name,
+    enabled: monitor.enabled && monitor.type !== "none",
+    type: monitor.type,
+    target: monitor.target ?? device.managementIp ?? "",
+    port: monitor.port != null ? String(monitor.port) : "",
+    path: monitor.path ?? "",
+    ignoreTlsErrors: monitor.ignoreTlsErrors,
+    snmpVersion:
+      monitor.snmpVersion === "1" ||
+      monitor.snmpVersion === "2c" ||
+      monitor.snmpVersion === "3"
+        ? monitor.snmpVersion
+        : "2c",
+    snmpCommunity: "",
+    clearSnmpCommunity: false,
+    snmpOid: monitor.snmpOid ?? "",
+    snmpExpectedValue: monitor.snmpExpectedValue ?? "",
+    snmpMatchMode: monitor.snmpMatchMode ?? "equals",
+    portId: monitor.portId ?? "",
+    snmpIfIndex: monitor.snmpIfIndex != null ? String(monitor.snmpIfIndex) : "",
+    snmpCredentialId: monitor.snmpCredentialId ?? "",
+    intervalMinutes:
+      monitor.intervalMs != null
+        ? String(Math.max(1, Math.round(monitor.intervalMs / 60000)))
+        : "5",
+  };
+}
+
+function describeMonitorType(
+  type: MonitorForm["type"],
+  t: ReturnType<typeof useI18n>["t"],
+) {
+  switch (type) {
+    case "icmp":
+      return t(
+        'ICMP is best for simple reachability. It answers "can the Rackpad server or container reach this host on the network?"',
+      );
+    case "tcp":
+      return t(
+        "TCP checks a specific service port from the Rackpad server. Port 22 only shows online when SSH itself is reachable from the server or container.",
+      );
+    case "http":
+      return t(
+        "HTTP checks fetch a URL from the Rackpad server and expect a successful response.",
+      );
+    case "https":
+      return t(
+        "HTTPS checks fetch a secure URL from the Rackpad server and expect a successful response.",
+      );
+    case "snmp":
+      return t(
+        "SNMP polls one OID from the Rackpad server. Use an expected value for interface checks, such as ifOperStatus = 1 for up.",
+      );
+    default:
+      return t(
+        "Choose a monitor type to enable automated health checks for this device.",
+      );
+  }
+}
+
+function formatPlacement(
+  placement: Device["placement"] | undefined,
+  t: ReturnType<typeof useI18n>["t"],
+) {
+  switch (placement) {
+    case "rack":
+      return t("Rack mounted");
+    case "wireless":
+      return t("WiFi / AP linked");
+    case "virtual":
+      return t("Virtual");
+    case "shelf":
+      return t("On this shelf / tray");
+    case "room":
+      return t("Loose / room");
+    default:
+      return t("Loose / room");
+  }
+}
+
+function formatRackSlot(
+  slot: Device["rackSlot"] | undefined,
+  t: ReturnType<typeof useI18n>["t"],
+) {
+  if (slot === "left") return t("Left half");
+  if (slot === "right") return t("Right half");
+  return t("Full width");
+}
+
+function formatRackUnit(
+  device: Device,
+  t: ReturnType<typeof useI18n>["t"],
+  includeHeight = false,
+) {
+  if (!device.startU) return "";
+  const heightU = device.heightU ?? 1;
+  const range =
+    heightU > 1
+      ? `U${device.startU}-${device.startU + heightU - 1}`
+      : `U${device.startU}`;
+  const slot =
+    (device.rackSlot ?? "full") === "full"
+      ? ""
+      : ` | ${formatRackSlot(device.rackSlot, t)}`;
+  return includeHeight ? `${range}${slot} (${heightU}U)` : `${range}${slot}`;
+}
+
+function formatCapacityValue(value?: number) {
+  if (value == null) return "-";
+  if (Number.isInteger(value)) return String(value);
+  return value.toFixed(1).replace(/\.0$/, "");
+}
+
+function formatCapacityUnit(value: number | undefined, unit: string) {
+  const formatted = formatCapacityValue(value);
+  return formatted === "-" ? undefined : `${formatted} ${unit}`;
+}
+
+function overviewStorageSourceLabel(source: OverviewStorageSource) {
+  if (source === "usable-topology") return "Usable topology" as const;
+  if (source === "raw-topology") return "Raw topology" as const;
+  return "Manual / imported" as const;
+}

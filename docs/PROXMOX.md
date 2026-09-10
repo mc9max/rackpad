@@ -1,0 +1,141 @@
+# Rackpad on Proxmox
+
+Rackpad runs well in a small Debian or Ubuntu LXC on Proxmox. The recommended
+path is to enable LXC nesting, install Docker inside the container, and pull the
+published Rackpad container image from GHCR. This avoids cloning the source repo
+onto the server.
+
+A first-party, non-Docker helper is implemented for staged beta validation. Its
+target is Proxmox VE 9.x on `amd64`, using an unprivileged Debian 13 LXC by
+default or Ubuntu 24.04 LTS as an alternative requiring guest validation. It is not a supported
+production installer until the beta and stable gates are complete. An exact
+published beta.5 procedure is available for disposable community testing. See the
+[native LXC operations guide](./PROXMOX_NATIVE_LXC.md) and
+[roadmap](./PROXMOX_LXC_ROADMAP.md).
+
+If you want to import Proxmox node, VM, container, bridge, MAC, VLAN, IP, CPU,
+RAM, and disk data into Rackpad, see the
+[Proxmox import guide](./PROXMOX_IMPORT.md).
+
+## Recommended LXC size
+
+- Debian 12 or Ubuntu 24.04 LXC
+- 2 vCPU minimum
+- 2 GB RAM minimum, 4 GB preferred
+- 8 GB disk minimum, 16 GB preferred
+- Static DHCP lease or fixed IP recommended
+
+## Enable nesting
+
+Docker inside an LXC needs nesting enabled.
+
+From the Proxmox UI:
+
+1. Select the container.
+2. Open `Options`.
+3. Open `Features`.
+4. Enable `Nesting`.
+5. Restart the container.
+
+Or from the Proxmox host shell:
+
+```bash
+pct set <CTID> -features nesting=1,keyctl=1
+pct reboot <CTID>
+```
+
+Replace `<CTID>` with the container ID.
+
+## Install Rackpad without git clone
+
+Run this inside the LXC:
+
+```bash
+apt-get update
+apt-get install -y curl ca-certificates
+curl -fsSL https://raw.githubusercontent.com/Kobii-git/Rackpad/main/scripts/install-docker.sh | bash
+```
+
+The stable installer writes a Compose project to `/opt/rackpad`, pulls the release
+image, starts the container, and stores data in the Docker volume
+`rackpad_data`.
+
+Open Rackpad at:
+
+```text
+http://LXC_IP:3000
+```
+
+## Network discovery in an LXC
+
+If Rackpad opens normally but **Discovery** cannot see the local subnet, the
+container probably does not have enough layer-2 visibility. This is common with
+Docker bridge networking inside an unprivileged LXC.
+
+Use the host-network discovery compose variant inside the LXC:
+
+```bash
+cd /opt/rackpad
+curl -fsSLo compose.host-discovery.yml https://raw.githubusercontent.com/Kobii-git/Rackpad/main/docker-compose.host-discovery.yml
+docker compose -f compose.host-discovery.yml pull
+docker compose -f compose.host-discovery.yml up -d
+```
+
+That variant keeps the same `rackpad_data` volume but runs Rackpad with host
+networking, root inside the container, and the `NET_RAW` and `NET_ADMIN` capabilities for ICMP/ARP-style discovery tools.
+The manifest also includes `NET_BIND_SERVICE`; UDP 1162 does not require that capability. See
+the full [Docker network discovery guide](./DOCKER_DISCOVERY.md) before exposing
+this outside a trusted LAN or VPN.
+
+## Install a specific version or port
+
+The script defaults to the current stable release. To install the current beta:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Kobii-git/Rackpad/main/scripts/install-docker.sh -o /tmp/install-rackpad.sh
+RACKPAD_TAG=beta bash /tmp/install-rackpad.sh
+```
+
+To follow the newest stable GHCR image instead of pinning a release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Kobii-git/Rackpad/main/scripts/install-docker.sh -o /tmp/install-rackpad.sh
+RACKPAD_TAG=latest bash /tmp/install-rackpad.sh
+```
+
+For a custom port:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Kobii-git/Rackpad/main/scripts/install-docker.sh -o /tmp/install-rackpad.sh
+RACKPAD_PORT=8080 bash /tmp/install-rackpad.sh
+```
+
+## Update later
+
+Inside the LXC:
+
+```bash
+cd /opt/rackpad
+docker compose pull
+docker compose up -d
+```
+
+If you pinned a version in `/opt/rackpad/.env`, update `RACKPAD_TAG` before
+running the pull.
+
+## Backups
+
+Rackpad stores its SQLite database in the `rackpad_data` Docker volume. For app
+level backups, use the admin backup export from the Rackpad Users screen before
+upgrades or container rebuilds. Preserve `/opt/rackpad/.env` and the original
+`RACKPAD_SECRET_KEY` with protected backups; encrypted credentials cannot be
+recovered from the database alone.
+
+## Notes
+
+- Keep Rackpad on a private LAN, VPN, or behind a trusted reverse proxy.
+- For 1.8.2 beta behind Cloudflare or another proxy, set `TRUST_PROXY` to controlled proxy IPs/CIDRs,
+  `TRUSTED_HOSTS`, and `TRUSTED_ORIGINS` in `/opt/rackpad/.env`. Stable 1.8.0 uses hop counts; see the version-specific [proxy guide](../INSTALL.md#reverse-proxy-and-tls).
+- The native host-side helper is pre-release. Keep using this Docker path for
+  supported installations until its roadmap marks the stable deployment phase
+  complete.
